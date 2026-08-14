@@ -513,9 +513,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         block_sizes = []
         max_num_blocks_per_group = []
+        # KV cache groups whose KV is replicated on every DCP rank (DSpark draft).
+        cp_exempt_groups: list[int] = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            # Replicated draft groups (non_causal_multi_token_decode) use an
+            # unsharded slot mapping so every rank writes the full sequence.
+            if getattr(spec, "non_causal_multi_token_decode", False):
+                cp_exempt_groups.append(len(block_sizes) - 1)
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -561,6 +567,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            cp_exempt_groups=cp_exempt_groups,
         )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,

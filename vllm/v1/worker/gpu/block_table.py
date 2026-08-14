@@ -26,7 +26,11 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        cp_exempt_groups: list[int] | None = None,
     ):
+        # Groups listed here use an unsharded slot mapping (CP_SIZE=1) so every rank
+        # writes the full sequence; used for DSpark draft MLA under DCP.
+        self.cp_exempt_groups = list(cp_exempt_groups or ())
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
         self.max_num_reqs = max_num_reqs
@@ -211,6 +215,25 @@ class BlockTables:
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
+        # Re-run the slot-mapping kernel with CP_SIZE=1 for replicated groups.
+        if self.cp_size > 1:
+            for gid in self.cp_exempt_groups:
+                _compute_slot_mappings_kernel[(1, num_reqs + 1)](
+                    slot_mappings.shape[1],
+                    idx_mapping,
+                    query_start_loc,
+                    positions,
+                    self.block_table_ptrs[gid:],
+                    self.block_table_strides[gid:],
+                    self.block_sizes_tensor[gid:],
+                    slot_mappings[gid:],
+                    slot_mappings.stride(0),
+                    0,
+                    CP_SIZE=1,
+                    CP_INTERLEAVE=self.cp_interleave,
+                    PAD_ID=PAD_SLOT_ID,
+                    TRITON_BLOCK_SIZE=1024,  # type: ignore
+                )
         return slot_mappings[:, :num_tokens_padded]
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:

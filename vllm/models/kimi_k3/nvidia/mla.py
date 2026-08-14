@@ -340,7 +340,27 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             "Kimi-K3 MultiHeadLatentAttention does not support prefill context "
             "parallelism."
         )
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        if self.non_causal_multi_token_decode:
+            # The DSpark draft attends over the whole sequence and discards its
+            # decode LSE, so its KV cache group is replicated on every DCP rank
+            # rather than sharded. Such a layer sees the full sequence locally and
+            # takes no part in the target's gather/merge.
+            self.dcp_world_size = 1
+            self.impl.dcp_world_size = 1
+            self.impl.dcp_rank = 0
+            self.impl.need_to_return_lse_for_decode = False
+            if hasattr(self.impl, "_decode_num_heads"):
+                # Backends that size decode for the DCP-gathered query heads
+                # cached that count from the group's dcp_world_size at
+                # construction; this layer just left the DCP group.
+                self.impl._decode_num_heads = self.num_local_heads
+        else:
+            self.dcp_world_size = parallel_config.decode_context_parallel_size
+        assert self.dcp_world_size <= 1 or self.rotary_emb is None, (
+            "Kimi-K3 MultiHeadLatentAttention does not support RoPE with decode "
+            "context parallelism because gathered queries require gathered "
+            "positions."
+        )
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             query_dtype = (

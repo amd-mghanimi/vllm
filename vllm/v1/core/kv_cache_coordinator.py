@@ -141,7 +141,16 @@ class KVCacheCoordinator(ABC):
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                # Replicated draft groups keep dcp_world_size=1 block geometry.
+                dcp_world_size=(
+                    1
+                    if getattr(
+                        kv_cache_group.kv_cache_spec,
+                        "non_causal_multi_token_decode",
+                        False,
+                    )
+                    else dcp_world_size
+                ),
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,

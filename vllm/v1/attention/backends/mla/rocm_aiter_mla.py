@@ -262,6 +262,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        # NOTE: supports_dcp_with_varlen stays False. A drafter's verify batch
+        # would otherwise remain a decode under DCP, but DCP needs a decode LSE
+        # and aiter ships no fp8 gqa16 qseqlen2 kernel with an LSE variant, so a
+        # 2-token verify dies with "cannot get heuristic kernel ... qseqlen:2
+        # lse:1". qlen 3 already remaps onto the qseqlen4 LSE kernel, so filling
+        # that one dispatch hole is all this needs.
         super().__init__(
             kv_cache_spec, layer_names, vllm_config, device, AiterMLAMetadata
         )

@@ -2140,6 +2140,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
+        # Replicated draft groups (non_causal_multi_token_decode) use whole-sequence
+        # metadata and do not participate in the target's DCP merge.
+        if self.non_causal_multi_token_decode:
+            self.dcp_world_size = 1
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
