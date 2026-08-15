@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import inspect
+import re
 from dataclasses import dataclass
 from typing import ClassVar, Final
 
@@ -26,6 +28,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 logger = init_logger(__name__)
@@ -92,6 +95,26 @@ def _gluon_mla_decode_supported() -> bool:
     except Exception:  # noqa: BLE001
         return False
     return on_gfx950()
+
+
+@functools.lru_cache(maxsize=1)
+def _gluon_mla_max_bh16_heads() -> int:
+    """Largest head count the Gluon MLA bh16 regimes accept.
+
+    ROCm/aiter#4412 tiles the head range into ``cdiv(nhead, 16)`` blocks on the
+    grid, lifting the bound from 16 to 96, which is what TP8 x DCP8 gathers.
+    The bound is read off the wrapper's own assert so that an older aiter keeps
+    the pre-#4412 gating instead of asserting inside the kernel launch.
+    """
+    fallback = AiterMLAHelper._AITER_MIN_MLA_HEADS
+    try:
+        source = inspect.getsource(_get_mla_gluon())
+    except Exception:  # noqa: BLE001
+        return fallback
+    match = re.search(r"requires nhead <= (\d+)", source)
+    if match is None:
+        return fallback
+    return max(fallback, int(match.group(1)))
 
 
 def _aiter_mla_small_head_mode() -> str:
@@ -262,14 +285,29 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        # NOTE: supports_dcp_with_varlen stays False. A drafter's verify batch
-        # would otherwise remain a decode under DCP, but DCP needs a decode LSE
-        # and aiter ships no fp8 gqa16 qseqlen2 kernel with an LSE variant, so a
-        # 2-token verify dies with "cannot get heuristic kernel ... qseqlen:2
-        # lse:1". qlen 3 already remaps onto the qseqlen4 LSE kernel, so filling
-        # that one dispatch hole is all this needs.
+        # Keeping a drafter's verify batch on the decode path under DCP needs a
+        # decode LSE for every uniform query length the runner can produce, and a
+        # causal window taken in global positions. The Gluon flatten gives both
+        # for any length; the asm decode has LSE kernels for only a few lengths
+        # and takes the window per rank. Interleaving the KV shard by more than
+        # one token is unsupported, as in FlashAttnMLA.
+        parallel_config = vllm_config.parallel_config
+        gathered_num_heads = (
+            vllm_config.model_config.get_num_attention_heads(parallel_config)
+            * parallel_config.decode_context_parallel_size
+        )
         super().__init__(
-            kv_cache_spec, layer_names, vllm_config, device, AiterMLAMetadata
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            AiterMLAMetadata,
+            supports_dcp_with_varlen=(
+                parallel_config.cp_kv_cache_interleave_size == 1
+                and AiterMLAHelper.use_gluon_verify(
+                    gathered_num_heads, 2, vllm_config.cache_config.cache_dtype
+                )
+            ),
         )
 
         self.compilation_config = vllm_config.compilation_config
@@ -946,20 +984,55 @@ class AiterMLAHelper:
 
     @staticmethod
     def use_gluon_verify(num_heads: int, max_qo_len: int, kv_cache_dtype: str) -> bool:
-        """Whether a small-head multi-token verify is flattened onto Gluon.
+        """Whether a multi-token verify is flattened onto Gluon.
 
-        bf16 has no gqa<16, qseqlen>1 asm kernel, so the verify is flattened
-        into per-token Gluon decodes. fp8 has one via the q-row fold and must
-        not come here: the flatten hands Gluon the batch size its fp8 regime
-        asserts against. A predicate rather than inline in forward_mqa so the
-        builder sees the same answer the impl acts on.
+        Each verify row becomes its own batch entry with its own KV range, so the
+        kernel applies no causal tail of its own. That is what makes the flatten
+        correct under DCP: the tail has to be taken in global positions, and the
+        dropped tokens land on different ranks, so no per-rank length can express
+        it (see `dcp_local_verify_row_lens`). It also returns a per-row LSE, which
+        is what DCP merges with.
+
+        Needs a head count Gluon takes: ROCm/aiter#4412 tiles up to 96, which is
+        what TP8 x DCP8 gathers. Gluon's fp8-KV regime reads a bf16 query, so an
+        fp8 KV cache keeps the asm decode.
         """
-        if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS or max_qo_len <= 1:
+        if max_qo_len <= 1:
+            return False
+        if num_heads > _gluon_mla_max_bh16_heads():
             return False
         if is_quantized_kv_cache(kv_cache_dtype):
             return False
         # Same arch and mode gating as use_gluon_decode.
         return _aiter_mla_small_head_mode() != "asm" and _gluon_mla_decode_supported()
+
+    @staticmethod
+    def dcp_local_verify_row_lens(
+        tot_seq_lens: torch.Tensor,
+        qlen: int,
+        dcp_world_size: int,
+        dcp_rank: int,
+        cp_interleave: int,
+    ) -> torch.Tensor:
+        """Local KV length of every row of a DCP verify block.
+
+        Row `i` of a qlen-token verify attends global positions
+        `[0, seq_len - qlen + i]`, so its local length is the round-robin count
+        evaluated at that bound. Taking the request's full local length and
+        subtracting the causal offset is wrong: those dropped tail tokens sit on
+        `qlen - 1 - i` different ranks, so only some ranks lose one, while the
+        subtraction takes one from every rank.
+
+        The mapping itself is the shared `get_dcp_local_seq_lens`; only the bound
+        it is evaluated at is per row rather than once per request.
+        """
+        offsets = torch.arange(
+            qlen, device=tot_seq_lens.device, dtype=tot_seq_lens.dtype
+        )
+        visible = (tot_seq_lens.unsqueeze(1) - (qlen - 1) + offsets).clamp_(min=0)
+        return get_dcp_local_seq_lens(
+            visible, dcp_world_size, dcp_rank, cp_interleave
+        ).flatten()
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
@@ -996,6 +1069,19 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         AiterMLAHelper.check_num_heads_validity(num_heads)
         self._decode_num_heads = self.num_heads * self.dcp_world_size
         AiterMLAHelper.check_num_heads_validity(self._decode_num_heads)
+
+        # Needed to place a verify row's causal window on this rank's KV shard.
+        self._cp_kv_cache_interleave_size = 1
+        if self.dcp_world_size > 1:
+            from vllm.config import get_current_vllm_config
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self._dcp_rank = get_dcp_group().rank_in_group
+            self._cp_kv_cache_interleave_size = (
+                get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+            )
+        else:
+            self._dcp_rank = 0
 
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
@@ -1298,14 +1384,21 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             row_req = torch.arange(per_req_len.shape[0], device=dev).repeat_interleave(
                 qlen
             )
-            row_len = (
-                (
-                    per_req_len.unsqueeze(1)
-                    - (qlen - 1)
-                    + torch.arange(qlen, device=dev, dtype=per_req_len.dtype)
-                )
-                .clamp_(min=0)
-                .flatten()
+            # Under DCP a row's window has to be counted in global positions and
+            # then mapped onto this rank's shard, because the tail tokens a row
+            # drops sit on other ranks. Without DCP the shard is the whole
+            # sequence and this reduces to per_req_len - (qlen - 1) + t.
+            row_len_source = (
+                decode.dcp_tot_seq_lens
+                if self.dcp_world_size > 1 and decode.dcp_tot_seq_lens is not None
+                else per_req_len
+            )
+            row_len = AiterMLAHelper.dcp_local_verify_row_lens(
+                row_len_source,
+                qlen,
+                self.dcp_world_size,
+                self._dcp_rank,
+                self._cp_kv_cache_interleave_size,
             )
             new_indptr = torch.cat([old_indptr.new_zeros(1), row_len.cumsum(0)]).to(
                 torch.int32
@@ -1319,7 +1412,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             )
             new_indices = decode.paged_kv_indices[src]
             mla_gluon = _get_mla_gluon()
-            mla_gluon(
+            need_lse = self.dcp_world_size > 1
+            gluon_ret = mla_gluon(
                 q_nope=q_nope,
                 q_pe=q_pe,
                 kv_c=kv_buffer,
@@ -1332,8 +1426,22 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 use_2d_view=False,
                 kv_scale=1.0,
                 min_kv_seq_len=int(row_len.min()),
+                return_lse=need_lse,
             )
-            return o, None
+            if not need_lse:
+                return o, None
+            lse = gluon_ret[1] if isinstance(gluon_ret, tuple) else None
+            assert lse is not None, (
+                "aiter mla_gluon(return_lse=True) returned no LSE; upgrade aiter "
+                "to a build with gluon LSE support."
+            )
+            # A row whose shard holds none of its window contributes nothing to
+            # the merge. Its output is never written either, so clear it: a -inf
+            # weight would still carry an uninitialized NaN into the sum.
+            empty_rows = (row_len == 0).unsqueeze(1)
+            lse = lse.reshape(B, num_q_heads).masked_fill(empty_rows, float("-inf"))
+            o = o.masked_fill(empty_rows.unsqueeze(2), 0)
+            return o, lse
 
         if type(q) is tuple:
             q = torch.cat(q, dim=-1)
