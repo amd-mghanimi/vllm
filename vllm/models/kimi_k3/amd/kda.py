@@ -53,6 +53,12 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
 )
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
@@ -287,17 +293,17 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
-        self._forward(
-            mixed_qkv=mixed_qkv,
-            g1=g1,
-            g2=g2,
-            beta=beta,
-            core_attn_out=core_attn_out,
+        torch.ops.vllm.kimi_kda_attention_core(
+            mixed_qkv,
+            g1,
+            g2,
+            beta,
+            core_attn_out,
+            _encode_layer_name(self.prefix),
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
 
-    @eager_break_during_capture
     def _forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -617,3 +623,50 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         else:
             assert core_attn_out_spec is not None
         core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+
+
+@eager_break_during_capture
+def kimi_kda_attention_core(
+    mixed_qkv: torch.Tensor,
+    g1: torch.Tensor,
+    g2: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """Piecewise split around the KDA conv1d + recurrent/chunk core.
+
+    ``core_attn_out`` is mutated in place. Registering this as a custom op
+    (and listing it in ``CompilationConfig._attention_ops``) keeps the KDA
+    branch visible to torch.compile and lets piecewise / breakable CUDA
+    graphs split here. GEMMs in ``forward`` stay outside the op.
+    """
+    layer_name = _resolve_layer_name(layer_name)
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    self._forward(
+        mixed_qkv=mixed_qkv,
+        g1=g1,
+        g2=g2,
+        beta=beta,
+        core_attn_out=core_attn_out,
+    )
+
+
+def kimi_kda_attention_core_fake(
+    mixed_qkv: torch.Tensor,
+    g1: torch.Tensor,
+    g2: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="kimi_kda_attention_core",
+    op_func=kimi_kda_attention_core,
+    mutates_args=["core_attn_out"],
+    fake_impl=kimi_kda_attention_core_fake,
+)

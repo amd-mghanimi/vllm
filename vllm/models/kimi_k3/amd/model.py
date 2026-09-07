@@ -8,6 +8,7 @@ from typing import cast
 import torch
 from torch import nn
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.compressed_tensors import (
@@ -52,6 +53,14 @@ from .linear import KimiLinearForCausalLM
     KimiK3MultiModalProcessor,
     info=KimiK3ProcessingInfo,
     dummy_inputs=KimiK3DummyInputsBuilder,
+)
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
 )
 class KimiK3ForConditionalGeneration(
     nn.Module,
