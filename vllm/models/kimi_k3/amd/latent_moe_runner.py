@@ -63,6 +63,10 @@ class ROCmLatentMoERunner(MoERunner):
     ) -> torch.Tensor:
         """
         Tier 2: column-parallel up-projection folded into the final reduce.
+
+        Dual-stream shared experts are waited *after* the latent all-reduce:
+        AR only needs ``fused_output``, so a wait between gemm2 and AR is a
+        captured no-op hole on the main stream.
         """
         if not self._logged_sharded_tail:
             self._logged_sharded_tail = True
@@ -78,6 +82,10 @@ class ROCmLatentMoERunner(MoERunner):
         latent = tensor_model_parallel_all_reduce(fused_output)
         if transform.norm is not None:
             latent = transform.norm(latent)
+
+        # Shared-expert Event.wait was deferred so it is not a graph node
+        # between gemm2 and this all-reduce. The addmm below reads shared_output.
+        self._wait_deferred_shared_experts()
 
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
@@ -130,24 +138,30 @@ class ROCmLatentMoERunner(MoERunner):
             )
         )
 
-        result = self._forward_entry(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-            self._encode_layer_name(),
-            self.moe_config.hidden_dim_unpadded
-            if self._quant_method.has_unpadded_output
-            else 0,
-        )
+        self._defer_shared_experts_wait = True
+        try:
+            result = self._forward_entry(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                self._encode_layer_name(),
+                self.moe_config.hidden_dim_unpadded
+                if self._quant_method.has_unpadded_output
+                else 0,
+            )
 
-        shared_output, fused_output = cast(tuple[torch.Tensor, torch.Tensor], result)
+            shared_output, fused_output = cast(
+                tuple[torch.Tensor, torch.Tensor], result
+            )
 
-        if og_hidden_dim_pre_xform is not None:
-            fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+            if og_hidden_dim_pre_xform is not None:
+                fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
-        result = self._shard_up_proj_tail(
-            fused_output, shared_output, og_hidden_dim_post_xform
-        )
-
-        return self._maybe_add_zero_expert_output(result)
+            result = self._shard_up_proj_tail(
+                fused_output, shared_output, og_hidden_dim_post_xform
+            )
+            return self._maybe_add_zero_expert_output(result)
+        finally:
+            self._defer_shared_experts_wait = False
+            self._wait_deferred_shared_experts()
