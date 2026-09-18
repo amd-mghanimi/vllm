@@ -295,6 +295,12 @@ class MoERunner(MoERunnerInterface):
 
         self._forward_entry = self._select_forward()
 
+        # When True, `_apply_quant_method` skips Event.wait after routed
+        # experts so a subclass can overlap the next capture-stream op
+        # (e.g. latent all-reduce) with leftover shared-expert work.
+        self._defer_shared_experts_wait = False
+        self._shared_experts_wait_pending = False
+
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
 
@@ -608,7 +614,10 @@ class MoERunner(MoERunnerInterface):
 
         `shared_experts_overlapping` should be True only if using multi-stream
         overlap. Then the shared expert was already launched in a separate
-        stream, so the results only have to be awaited here.
+        stream, so the results only have to be awaited here. Subclasses may set
+        `_defer_shared_experts_wait` to skip the wait when the next consumer of
+        `fused_out` does not read the shared-expert buffer (Kimi-K3 AMD latent
+        AR). Call `_wait_deferred_shared_experts` before using that buffer.
         """
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
@@ -640,12 +649,23 @@ class MoERunner(MoERunnerInterface):
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
-            self._shared_experts.wait()
+            if self._defer_shared_experts_wait:
+                self._shared_experts_wait_pending = True
+            else:
+                self._shared_experts.wait()
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
             fused_out,
         )
+
+    def _wait_deferred_shared_experts(self) -> None:
+        """Complete a dual-stream wait skipped by `_defer_shared_experts_wait`."""
+        if not self._shared_experts_wait_pending:
+            return
+        assert self._shared_experts is not None
+        self._shared_experts.wait()
+        self._shared_experts_wait_pending = False
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
