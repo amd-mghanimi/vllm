@@ -58,16 +58,30 @@ class SharedExperts(torch.nn.Module):
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
 
         # Allow disabling of the separate shared experts stream for
-        # debug purposes.
+        # debug purposes (and for profiler A/B: HIP graph Event.wait after
+        # routed gemm2 can show up as GPU-union idle before the next AR).
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
         if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
-            logger.debug_once("Disabling MoE shared_experts cuda stream")
+            logger.info_once(
+                "Disabling MoE shared_experts aux stream "
+                "(VLLM_DISABLE_SHARED_EXPERTS_STREAM=1). Shared experts run "
+                "on the capture stream, sequentially with routed experts.",
+                scope="global",
+            )
             self._stream = None
         else:
             self._stream = aux_stream()
             if self._stream is not None:
-                logger.debug_once("Enabled separate cuda stream for MoE shared_experts")
+                logger.info_once(
+                    "Enabled MoE shared_experts aux stream (dual-stream). "
+                    "Overlap fires when tokens <= "
+                    "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=%s. "
+                    "Set VLLM_DISABLE_SHARED_EXPERTS_STREAM=1 to force "
+                    "sequential execution.",
+                    envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+                    scope="global",
+                )
                 # One pair per DBO ubatch id to sync aux and main stream.
                 self._input_ready_event = [torch.cuda.Event(), torch.cuda.Event()]
                 self._output_ready_event = [torch.cuda.Event(), torch.cuda.Event()]
@@ -116,9 +130,21 @@ class SharedExperts(torch.nn.Module):
         )
 
         if should_run_shared_in_aux_stream:
-            return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            order = SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         else:
-            return SharedExpertsOrder.NO_OVERLAP
+            order = SharedExpertsOrder.NO_OVERLAP
+        logger.info_once(
+            "MoE shared-experts order=%s tokens=%s threshold=%s "
+            "aux_stream=%s disable_env=%s tp=%s",
+            order.name,
+            int(hidden_states.shape[0]),
+            envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+            self._stream is not None,
+            envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM,
+            self._moe_config.tp_size,
+            scope="global",
+        )
+        return order
 
     def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:
         """Enqueue shared experts on the aux stream without waiting for them.

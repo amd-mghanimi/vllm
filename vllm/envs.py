@@ -2028,7 +2028,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug workspace allocations.
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
-    # Disables parallel execution of shared_experts via separate cuda stream
+    # Disables parallel execution of shared_experts via separate cuda stream.
+    # Dual-stream (vLLM #52033) launches shared experts on aux_stream before
+    # routed fused-MoE, then Event.wait on the capture stream after gemm2.
+    # That wait is HIP-graph captured and can look like GPU-union idle before
+    # the next all-reduce, and ROCm profilers have inflated it (#55099).
+    # A/B: VLLM_DISABLE_SHARED_EXPERTS_STREAM=1 (do not use threshold=0;
+    # the gate is tokens <= threshold, so 0 is not "off").
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
     ),
