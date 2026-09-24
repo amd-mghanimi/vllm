@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -130,12 +131,24 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        # HRX does not implement event record/wait yet. With pinned memory
+        # disabled, synchronize and copy on the producer stream instead.
+        self._hrx_sync_output = os.getenv("VLLM_HRX_SYNC_OUTPUT", "0") == "1"
+        self.copy_event = (
+            None
+            if self._hrx_sync_output
+            else torch.cuda.Event(blocking=True)
+        )
         self._has_fault: torch.Tensor | None = None
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        with stream(
+            main_stream if self._hrx_sync_output else copy_stream,
+            main_stream,
+        ):
+            if self._hrx_sync_output:
+                main_stream.synchronize()
+            else:
+                copy_stream.wait_stream(main_stream)
 
             self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
             self.logprobs_tensors: LogprobsTensors | None = None
@@ -164,10 +177,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
-            self.copy_event.record(copy_stream)
+            if self.copy_event is not None:
+                self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        self.copy_event.synchronize()
+        if self.copy_event is not None:
+            self.copy_event.synchronize()
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -255,7 +270,8 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
 
 
 def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
-    return x.to("cpu", non_blocking=True).numpy()
+    non_blocking = os.getenv("VLLM_HRX_SYNC_OUTPUT", "0") != "1"
+    return x.to("cpu", non_blocking=non_blocking).numpy()
 
 
 @contextlib.contextmanager

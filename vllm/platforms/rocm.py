@@ -617,6 +617,14 @@ class RocmPlatform(Platform):
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
+        if os.getenv("VLLM_ROCM_DISABLE_PIN_MEMORY", "0") == "1":
+            # This runs while torch_utils is importing; warning_once imports
+            # distributed state and creates a circular import here.
+            logger.warning(
+                "Using 'pin_memory=False' because "
+                "VLLM_ROCM_DISABLE_PIN_MEMORY=1."
+            )
+            return False
         if in_wsl():
             version = _get_wsl_kernel_version()
             if version is None or version < (4, 19, 121):
