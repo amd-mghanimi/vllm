@@ -104,6 +104,52 @@ def _make_impl(num_heads: int):
     return impl
 
 
+def _make_builder(
+    num_heads: int,
+    max_num_reqs: int,
+    max_prefill_qlen: int,
+    max_num_batched_tokens: int,
+    device: torch.device,
+    attn_out_dtype: torch.dtype = ATTN_OUT_DTYPE,
+):
+    """The production builder with its FP8 prefill PS buffers allocated."""
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAMetadataBuilder
+
+    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder.num_heads = num_heads
+    builder.mla_dims = SimpleNamespace(v_head_dim=V_HEAD_DIM)
+    builder._init_fp8_prefill_ps_buffers(
+        max_num_reqs=max_num_reqs,
+        max_prefill_qlen=max_prefill_qlen,
+        max_num_batched_tokens=max_num_batched_tokens,
+        attn_out_dtype=attn_out_dtype,
+        device=device,
+    )
+    return builder
+
+
+def _step_inputs(seq_lens: list[int], device: torch.device):
+    """Metadata inputs for one batch of prefills (does an H2D copy, so may sync)."""
+    qo_indptr_cpu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
+    qo_indptr_cpu[1:] = torch.tensor(seq_lens, dtype=torch.int32).cumsum(0)
+    qo_indptr = qo_indptr_cpu.to(device)
+
+    # SimpleNamespace stands in for the metadata dataclasses: the builder only
+    # reads prefill.{query_start_loc,max_query_len}, num_decodes, and
+    # common.query_start_loc_cpu, then populates metadata.fp8_prefill_*.
+    prefill = SimpleNamespace(query_start_loc=qo_indptr, max_query_len=max(seq_lens))
+    metadata = SimpleNamespace(prefill=prefill, num_decodes=0)
+    common = SimpleNamespace(query_start_loc_cpu=qo_indptr_cpu)
+    return metadata, common
+
+
+def _build_step(builder, seq_lens: list[int], device: torch.device):
+    """Run the builder's FP8 prefill metadata build for one batch of prefills."""
+    metadata, common = _step_inputs(seq_lens, device)
+    builder._build_fp8_prefill_ps_metadata(metadata, common)
+    return metadata
+
+
 def _build_prefill_metadata(
     seq_lens: list[int],
     device: torch.device,
@@ -111,33 +157,11 @@ def _build_prefill_metadata(
     attn_out_dtype: torch.dtype = ATTN_OUT_DTYPE,
 ):
     """Build metadata with the production builder and output dtype."""
-    from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAMetadataBuilder
-
-    qo_indptr_cpu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
-    qo_indptr_cpu[1:] = torch.tensor(seq_lens, dtype=torch.int32).cumsum(0)
-    qo_indptr = qo_indptr_cpu.to(device)
-    total_q = int(qo_indptr_cpu[-1].item())
-    max_q = max(seq_lens)
-
-    builder = object.__new__(AiterMLAMetadataBuilder)
-    builder.num_heads = num_heads
-    builder.mla_dims = SimpleNamespace(v_head_dim=V_HEAD_DIM)
-    builder._init_fp8_prefill_ps_buffers(
-        max_num_reqs=len(seq_lens),
-        max_prefill_qlen=max_q,
-        max_num_batched_tokens=total_q,
-        attn_out_dtype=attn_out_dtype,
-        device=device,
+    total_q = sum(seq_lens)
+    builder = _make_builder(
+        num_heads, len(seq_lens), max(seq_lens), total_q, device, attn_out_dtype
     )
-
-    # SimpleNamespace stands in for the metadata dataclasses: the builder only
-    # reads prefill.{query_start_loc,max_query_len}, num_decodes, and
-    # common.query_start_loc_cpu, then populates metadata.fp8_prefill_*.
-    prefill = SimpleNamespace(query_start_loc=qo_indptr, max_query_len=max_q)
-    metadata = SimpleNamespace(prefill=prefill, num_decodes=0)
-    common = SimpleNamespace(query_start_loc_cpu=qo_indptr_cpu)
-    builder._build_fp8_prefill_ps_metadata(metadata, common)
-    return metadata, total_q, builder
+    return _build_step(builder, seq_lens, device), total_q, builder
 
 
 def _reference(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -242,3 +266,152 @@ def test_fp8_prefill_metadata_width_matches_forward(num_heads: int) -> None:
 
     _, _, builder = _build_prefill_metadata([512], torch.device("cuda"), num_heads)
     assert builder.fp8_ps_reduce_partial_map.numel() == _tiles(width)
+
+
+# Ordering of the persistent PS plan across steps (vllm-project/vllm#58886).
+#
+# The builder keeps one set of device buffers for the FP8 prefill plan, and every
+# step's metadata aliases them. Under async scheduling the host builds step N+1
+# while step N's prefill kernels are still queued, so the rewrite must be ordered
+# after them on the stream. These tests make that overlap deterministic with a GPU
+# delay instead of waiting for serving to hit it:
+#   - Kernels of step N are replaced by clones of the plan buffers queued behind the
+#     delay. They read the plan like mla_prefill_ps_asm_fwd / mla_reduce_v1 do but
+#     cannot fault, so a stale plan shows up as a comparison failure, not a GPU
+#     memory fault that would take down the test process.
+#   - Everything runs on a non-blocking stream, as vLLM does
+#     (vllm.utils.torch_utils.current_stream). A stream-less hipMemcpy waits for the
+#     null stream, so on the default stream an unordered rewrite would look correct.
+#   - Only one extra stream is created. With more streams than HIP hardware queues
+#     (GPU_MAX_HW_QUEUES, default 4) the runtime shares queues, and sharing one with
+#     the null stream can order an unordered copy by accident.
+#   - Step inputs are prepared before the delay: moving qo_indptr to the device is a
+#     blocking copy that drains the stream, which would remove the overlap. Only the
+#     builder call itself runs while the delay is pending.
+#   - The check that the delay is still pending right before the rewrite guards
+#     against a vacuous pass on a fast host or a slow launch: without overlap there
+#     is nothing to order.
+ORDERING_BATCHES = ([8175], [6992, 6896, 2495], [4096, 4096, 4096, 4096])
+ORDERING_DELAY_MS = 200.0
+
+
+def _plan_buffers(builder) -> tuple[torch.Tensor, ...]:
+    """Device buffers get_ps_metadata_v1 writes and the prefill kernels read."""
+    return (
+        builder.fp8_ps_work_indptr,
+        builder.fp8_ps_work_info,
+        builder.fp8_ps_reduce_indptr,
+        builder.fp8_ps_reduce_final_map,
+        builder.fp8_ps_reduce_partial_map,
+    )
+
+
+def _ordering_builder(device: torch.device):
+    return _make_builder(
+        num_heads=16,
+        max_num_reqs=max(len(b) for b in ORDERING_BATCHES),
+        max_prefill_qlen=max(max(b) for b in ORDERING_BATCHES),
+        max_num_batched_tokens=max(sum(b) for b in ORDERING_BATCHES),
+        device=device,
+    )
+
+
+def _expected_plans(device: torch.device) -> list[list[torch.Tensor]]:
+    """Plan for each batch, built with nothing in flight."""
+    builder = _ordering_builder(device)
+    plans = []
+    for batch in ORDERING_BATCHES:
+        _build_step(builder, batch, device)
+        torch.cuda.synchronize()
+        plans.append([t.clone() for t in _plan_buffers(builder)])
+    assert not all(torch.equal(a, b) for a, b in zip(plans[0], plans[1])), (
+        "batches must produce different plans, or a stale read is undetectable"
+    )
+    return plans
+
+
+def _delay_cycles(stream: torch.cuda.Stream, ms: float) -> int:
+    """torch.cuda._sleep cycle count for about ``ms`` on this GPU."""
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(1_000_000)
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        torch.cuda._sleep(50_000_000)
+        end.record()
+    end.synchronize()
+    return int(50_000_000 * ms / start.elapsed_time(end))
+
+
+def _assert_plan(seen: list[torch.Tensor], expected: list[torch.Tensor], what: str):
+    for got, exp in zip(seen, expected):
+        assert torch.equal(got, exp), what
+
+
+@torch.inference_mode()
+def test_fp8_prefill_ps_metadata_rewrite_is_stream_ordered() -> None:
+    """Step N+1's plan rewrite must not reach step N's queued prefill kernels.
+
+    Before the fix, get_ps_metadata_v1 wrote the device buffers with a stream-less
+    blocking hipMemcpy: the rewrite landed at once and step N's queued reads saw
+    step N+1's plan (in serving: a GPU memory fault, or silently wrong attention).
+    With the fix the plan is staged on the host and copied on the current stream,
+    so it lands only after step N's kernels.
+    """
+    device = torch.device("cuda")
+    expected = _expected_plans(device)
+    builder = _ordering_builder(device)
+    stream = torch.cuda.Stream()
+    cycles = _delay_cycles(stream, ORDERING_DELAY_MS)
+
+    with torch.cuda.stream(stream):
+        _build_step(builder, ORDERING_BATCHES[0], device)  # step N
+        next_metadata, next_common = _step_inputs(ORDERING_BATCHES[1], device)
+        torch.cuda._sleep(cycles)  # step N's earlier layers
+        seen_by_step_n = [t.clone() for t in _plan_buffers(builder)]
+        step_n_done = torch.cuda.Event()
+        step_n_done.record()
+
+        overlapped = not step_n_done.query()
+        builder._build_fp8_prefill_ps_metadata(next_metadata, next_common)  # step N+1
+    torch.cuda.synchronize()
+
+    if not overlapped:
+        pytest.skip("GPU drained before step N+1 was built; nothing to order")
+    _assert_plan(seen_by_step_n, expected[0], "step N read step N+1's plan")
+    _assert_plan(
+        [t.clone() for t in _plan_buffers(builder)], expected[1], "step N+1's plan lost"
+    )
+
+
+@torch.inference_mode()
+def test_fp8_prefill_ps_metadata_staging_reuse_waits_for_copy() -> None:
+    """A host staging slot must not be replanned while its copy is still queued.
+
+    The fix alternates two pinned host staging slots, so the third build in a row
+    reuses the first build's slot. If that slot were overwritten before its queued
+    copy ran, the copy would carry the later plan and the first consumer would
+    read it. Queue three builds behind one GPU delay, each followed by a reader,
+    and check every reader sees its own step's plan.
+    """
+    device = torch.device("cuda")
+    expected = _expected_plans(device)
+    builder = _ordering_builder(device)
+    stream = torch.cuda.Stream()
+    cycles = _delay_cycles(stream, ORDERING_DELAY_MS)
+
+    seen = []
+    with torch.cuda.stream(stream):
+        inputs = [_step_inputs(batch, device) for batch in ORDERING_BATCHES]
+        torch.cuda._sleep(cycles)
+        delay_done = torch.cuda.Event()
+        delay_done.record()
+        overlapped = not delay_done.query()
+        for metadata, common in inputs:
+            builder._build_fp8_prefill_ps_metadata(metadata, common)
+            seen.append([t.clone() for t in _plan_buffers(builder)])
+    torch.cuda.synchronize()
+
+    if not overlapped:
+        pytest.skip("GPU drained before the first build; nothing to order")
+    for i, (got, exp) in enumerate(zip(seen, expected)):
+        _assert_plan(got, exp, f"step {i} read another step's plan")
