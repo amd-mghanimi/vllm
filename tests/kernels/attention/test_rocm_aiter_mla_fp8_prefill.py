@@ -291,6 +291,10 @@ def test_fp8_prefill_metadata_width_matches_forward(num_heads: int) -> None:
 #   - The check that the delay is still pending right before the rewrite guards
 #     against a vacuous pass on a fast host or a slow launch: without overlap there
 #     is nothing to order.
+#   - Each slot's CUDA event is allocated once in _init_fp8_prefill_ps_buffers and
+#     recorded again after that slot's copy. The tests keep those event objects and
+#     require later builds to reuse them. A build that allocated a fresh event would
+#     still order the copy, and would not be the code under test.
 ORDERING_BATCHES = ([8175], [6992, 6896, 2495], [4096, 4096, 4096, 4096])
 ORDERING_DELAY_MS = 200.0
 
@@ -347,6 +351,14 @@ def _assert_plan(seen: list[torch.Tensor], expected: list[torch.Tensor], what: s
         assert torch.equal(got, exp), what
 
 
+def _assert_same_staging_events(builder, events: tuple[torch.cuda.Event, ...]):
+    """Later builds must record the events allocated at init, not new ones."""
+    got = tuple(builder._fp8_ps_staging_free)
+    assert len(got) == len(events) and all(a is b for a, b in zip(got, events)), (
+        "staging events must be the two allocated at init"
+    )
+
+
 @torch.inference_mode()
 def test_fp8_prefill_ps_metadata_rewrite_is_stream_ordered() -> None:
     """Step N+1's plan rewrite must not reach step N's queued prefill kernels.
@@ -355,11 +367,14 @@ def test_fp8_prefill_ps_metadata_rewrite_is_stream_ordered() -> None:
     blocking hipMemcpy: the rewrite landed at once and step N's queued reads saw
     step N+1's plan (in serving: a GPU memory fault, or silently wrong attention).
     With the fix the plan is staged on the host and copied on the current stream,
-    so it lands only after step N's kernels.
+    so it lands only after step N's kernels. Step N+1 synchronizes the other
+    slot's event, which has not been recorded yet, so that wait must not drain
+    step N's queued reads.
     """
     device = torch.device("cuda")
     expected = _expected_plans(device)
     builder = _ordering_builder(device)
+    events = tuple(builder._fp8_ps_staging_free)
     stream = torch.cuda.Stream()
     cycles = _delay_cycles(stream, ORDERING_DELAY_MS)
 
@@ -375,6 +390,7 @@ def test_fp8_prefill_ps_metadata_rewrite_is_stream_ordered() -> None:
         builder._build_fp8_prefill_ps_metadata(next_metadata, next_common)  # step N+1
     torch.cuda.synchronize()
 
+    _assert_same_staging_events(builder, events)
     if not overlapped:
         pytest.skip("GPU drained before step N+1 was built; nothing to order")
     _assert_plan(seen_by_step_n, expected[0], "step N read step N+1's plan")
@@ -387,15 +403,17 @@ def test_fp8_prefill_ps_metadata_rewrite_is_stream_ordered() -> None:
 def test_fp8_prefill_ps_metadata_staging_reuse_waits_for_copy() -> None:
     """A host staging slot must not be replanned while its copy is still queued.
 
-    The fix alternates two pinned host staging slots, so the third build in a row
-    reuses the first build's slot. If that slot were overwritten before its queued
-    copy ran, the copy would carry the later plan and the first consumer would
-    read it. Queue three builds behind one GPU delay, each followed by a reader,
-    and check every reader sees its own step's plan.
+    The fix alternates two pinned host staging slots and re-records the event
+    allocated for that slot at init. The third build reuses the first slot. If
+    that slot were overwritten before its queued copy ran, the copy would carry
+    the later plan and the first consumer would read it. Queue three builds
+    behind one GPU delay, each followed by a reader, and check every reader
+    sees its own step's plan. The two events must be the same objects afterwards.
     """
     device = torch.device("cuda")
     expected = _expected_plans(device)
     builder = _ordering_builder(device)
+    events = tuple(builder._fp8_ps_staging_free)
     stream = torch.cuda.Stream()
     cycles = _delay_cycles(stream, ORDERING_DELAY_MS)
 
@@ -411,6 +429,7 @@ def test_fp8_prefill_ps_metadata_staging_reuse_waits_for_copy() -> None:
             seen.append([t.clone() for t in _plan_buffers(builder)])
     torch.cuda.synchronize()
 
+    _assert_same_staging_events(builder, events)
     if not overlapped:
         pytest.skip("GPU drained before the first build; nothing to order")
     for i, (got, exp) in enumerate(zip(seen, expected)):
