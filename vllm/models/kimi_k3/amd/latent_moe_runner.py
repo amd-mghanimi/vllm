@@ -65,9 +65,15 @@ class ROCmLatentMoERunner(MoERunner):
         shared_output: torch.Tensor,
         trunc_size: int | None,
     ) -> torch.Tensor:
-        """
-        Tier 2: column-parallel up-projection folded into the final reduce.
-        """
+        """Tier 2: column-parallel up-projection folded into the final reduce."""
+        if not self._logged_sharded_tail:
+            self._logged_sharded_tail = True
+            logger.info_once(
+                "Kimi-K3 latent-MoE tail: up-projecting only this rank's "
+                "hidden shard into the shared output.",
+                scope="global",
+            )
+
         transform = self.routed_output_transform
         assert transform is not None
 
