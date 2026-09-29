@@ -57,7 +57,10 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+from vllm.model_executor.warmup.kernel_warmup import (
+    kernel_warmup,
+    warmup_rocm_aiter_mm_encoder_fmha,
+)
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import (
@@ -477,6 +480,9 @@ class Worker(WorkerBase):
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
+
+            if get_pp_group().is_first_rank:
+                warmup_rocm_aiter_mm_encoder_fmha(self.vllm_config, self.device)
 
             # Set random seed.
             set_random_seed(self.model_config.seed)
