@@ -297,13 +297,17 @@ class KimiK3ReasoningParser(ReasoningParser):
         """Split full text into ``(reasoning, rest)`` for the non-streaming path.
 
         Handles four shapes:
-          * response opener without think markers -> no think channel; all content
+          * no think markers at all    -> all content. A bare answer never
+            opened a think channel in the completion, whether or not it also
+            carries ``<|open|>response<|sep|>``
           * open marker present       -> reasoning starts after ``<|open|>think<|sep|>``
           * open marker absent but a   close marker exists (gen-prefix consumed
             the open) -> reasoning starts at offset 0
-          * neither marker present     -> truncated reasoning after a consumed
-            generation prefix
+          * open marker without a close -> still reasoning, no content yet
         ``rest`` is whatever follows the close marker, fed on to the tool parser.
+        A think close is the evidence that a generation prefix opened the
+        channel. Marker-free text is not that case: classifying it as
+        truncated reasoning drops the answer from ``content``.
         """
         if not self._thinking_enabled:
             return None, self._content_after_reasoning(model_output, request)
@@ -314,11 +318,7 @@ class KimiK3ReasoningParser(ReasoningParser):
         content_start = m_open.end() if m_open is not None else 0
 
         m_close = self._think_close_re.search(model_output, content_start)
-        if (
-            m_open is None
-            and m_close is None
-            and self._response_open_re.search(model_output) is not None
-        ):
+        if m_open is None and m_close is None:
             return None, self._content_after_reasoning(model_output, request)
         if m_close is not None:
             reasoning = model_output[content_start : m_close.start()]

@@ -70,6 +70,32 @@ def test_extract_reasoning_with_xtml_tags():
     assert content == "answer"
 
 
+def test_extract_reasoning_marker_free_answer_is_content():
+    parser = KimiK3ReasoningParser(DummyTokenizer())
+    request = ChatCompletionRequest(model="test-model", messages=[])
+
+    reasoning, content = parser.extract_reasoning_content(
+        "The special magic number is 6920668.",
+        request,
+    )
+
+    assert reasoning is None
+    assert content == "The special magic number is 6920668."
+
+
+def test_extract_reasoning_response_opener_without_think_is_content():
+    parser = KimiK3ReasoningParser(DummyTokenizer())
+    request = ChatCompletionRequest(model="test-model", messages=[])
+
+    reasoning, content = parser.extract_reasoning_content(
+        f"{RESPONSE_OPEN}6920668",
+        request,
+    )
+
+    assert reasoning is None
+    assert content == "6920668"
+
+
 def test_extract_reasoning_with_generation_prefix_consumed():
     parser = KimiK3ReasoningParser(DummyTokenizer())
     request = ChatCompletionRequest(model="test-model", messages=[])
