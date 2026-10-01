@@ -48,13 +48,17 @@ class ROCmLatentMoERunner(MoERunner):
         if self._tail_shardable:
             assert up_proj is not None
             self._up_proj_shard_size = up_proj.weight.shape[0] // tp_size
+            logger.info_once(
+                "Kimi-K3 latent-MoE tail: up-projecting only this rank's "
+                "hidden shard into the shared output.",
+                scope="global",
+            )
         else:
             logger.warning_once(
                 "K3 latent-MoE tail is not shardable under this config, "
                 "falling back to the replicated up-projection.",
                 scope="global",
             )
-        self._logged_sharded_tail = False
 
     def _shard_up_proj_tail(
         self,
