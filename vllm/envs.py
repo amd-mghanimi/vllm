@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4: bool | None = None
     VLLM_ROCM_USE_AITER_MOE_SITUV2: Literal["auto", "a4w4", "a8w4", "a16w4"] = "auto"
+    VLLM_ROCM_USE_AITER_MOE_ROUTED_CHAIN: bool = False
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
@@ -1291,6 +1292,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "a4w4", "a8w4", "a16w4", "0", "1"],
         case_sensitive=False,
+    ),
+    # Kimi-K3 a4w4 SiTUv2 MoE at small batch: run router top-k, sort, gemm1
+    # and gemm2 as one AITER FlyDSL launch (routed_chain) instead of four.
+    "VLLM_ROCM_USE_AITER_MOE_ROUTED_CHAIN": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_MOE_ROUTED_CHAIN", "False").lower()
+        in ("true", "1")
     ),
     # Opt-in switch for a4w4 (FP4 activation) MoE on DeepSeek V4.1, AITER
     # MXFP4 backend. Default is a8w4 (FP8); set to "1" to enable a4w4
