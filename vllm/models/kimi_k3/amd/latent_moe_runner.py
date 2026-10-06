@@ -25,6 +25,10 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
 
 logger = init_logger(__name__)
 
+# AITER's routed_chain takes M <= 32; past 16 tokens it loses more to the
+# four-launch path than it saves.
+_ROUTED_CHAIN_MAX_TOKENS = 16
+
 
 class ROCmLatentMoERunner(MoERunner):
     """MoE runner for latent MoE with a replicated routed up-projection.
@@ -110,7 +114,10 @@ class ROCmLatentMoERunner(MoERunner):
         a4w4 SiTUv2 MoE on [gate; up] a16w4-shuffled weights, with no EP, bias
         or padding. Read on the first forward, after weights are processed.
         """
-        if not rocm_aiter_ops.is_moe_routed_chain_enabled():
+        if not (
+            rocm_aiter_ops.is_fused_moe_enabled()
+            and rocm_aiter_ops.get_fused_moe_situv2_activation() == "a4w4"
+        ):
             return False
         try:
             from aiter.ops.flydsl.moe_routed_chain import routed_chain  # noqa: F401
@@ -166,7 +173,11 @@ class ROCmLatentMoERunner(MoERunner):
     def _use_routed_chain(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ) -> bool:
-        if not self._routed_chain_layer_ok or self.router.capture_fn is not None:
+        if (
+            not self._routed_chain_layer_ok
+            or self.router.capture_fn is not None
+            or hidden_states.shape[0] > _ROUTED_CHAIN_MAX_TOKENS
+        ):
             return False
         if (
             hidden_states.dtype != torch.bfloat16
