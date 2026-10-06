@@ -1944,6 +1944,8 @@ class rocm_aiter_ops:
         VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: Controls shared expert fusion.
         VLLM_ROCM_USE_AITER_MOE_SITUV2: SiTUv2 FlyDSL MoE activation
             dtype (a16w4 | a8w4 | a4w4).
+        VLLM_ROCM_USE_AITER_MOE_ROUTED_CHAIN: Controls the one-launch
+            top-k + a4w4 SiTUv2 MoE chain for Kimi-K3 decode.
         VLLM_ROCM_USE_AITER_TRITON_GEMM: Controls Triton unquantized GEMM.
 
     Note:
@@ -2015,6 +2017,7 @@ class rocm_aiter_ops:
     _TRITON_SPARSE_MLA = envs.VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     _MOE_SITUV2 = _resolve_situv2_activation()
+    _MOE_ROUTED_CHAIN = envs.VLLM_ROCM_USE_AITER_MOE_ROUTED_CHAIN
     # TODO: Consolidate under _LINEAR_ENABLED
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
     # Lazily probed: whether aiter.topk_softmax supports the
@@ -2046,6 +2049,7 @@ class rocm_aiter_ops:
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
         cls._MOE_SITUV2 = _resolve_situv2_activation()
         _sync_aiter_situv2_moe_env()
+        cls._MOE_ROUTED_CHAIN = envs.VLLM_ROCM_USE_AITER_MOE_ROUTED_CHAIN
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
         cls._MOE_DISPATCH_POLICY = envs.VLLM_ROCM_AITER_MOE_DISPATCH_POLICY
 
@@ -2162,6 +2166,16 @@ class rocm_aiter_ops:
     def is_fused_moe_situv2_enabled(cls) -> bool:
         """True when a low-precision (a8w4/a4w4) SiTUv2 activation is selected."""
         return cls.is_fused_moe_enabled() and cls._MOE_SITUV2 != "a16w4"
+
+    @classmethod
+    @if_aiter_supported
+    def is_moe_routed_chain_enabled(cls) -> bool:
+        """Whether a4w4 SiTUv2 MoE may run top-k through gemm2 as one launch."""
+        return (
+            cls.is_fused_moe_enabled()
+            and cls._MOE_SITUV2 == "a4w4"
+            and cls._MOE_ROUTED_CHAIN
+        )
 
     @classmethod
     @if_aiter_supported
