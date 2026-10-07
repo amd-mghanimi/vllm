@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from functools import cached_property
 from typing import cast
 
@@ -12,6 +13,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SituAndMul
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     FusedTopKBiasRouter,
 )
@@ -195,12 +197,66 @@ class ROCmLatentMoERunner(MoERunner):
             w13.shape[1] // 2,
         )
 
+    @cached_property
+    def _chain_shared_weights(self) -> tuple | None:
+        """(gate_up weight, down weight, beta, linear_beta) when routed_chain can run
+        this layer's shared expert in the same launch (VLLM_ROCM_K3_CHAIN_SHARED=1).
+
+        The shared expert must be KimiMLP as vLLM builds it for K3: unquantized bf16,
+        no bias, SiTU, and an unreduced down projection (the tail reduces it).
+        """
+        if os.environ.get("VLLM_ROCM_K3_CHAIN_SHARED", "0") != "1":
+            return None
+        if not self._routed_chain_layer_ok or self.gate is not None:
+            return None
+        try:
+            from aiter.ops.flydsl.moe_routed_chain import shared_supported  # noqa: F401
+        except ImportError:
+            return None
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        mlp = getattr(self._shared_experts, "_layer", None)
+        gate_up = getattr(mlp, "gate_up_proj", None)
+        down = getattr(mlp, "down_proj", None)
+        act = getattr(mlp, "act_fn", None)
+        if not (
+            isinstance(act, SituAndMul)
+            and gate_up is not None
+            and down is not None
+            and isinstance(gate_up.quant_method, UnquantizedLinearMethod)
+            and isinstance(down.quant_method, UnquantizedLinearMethod)
+            and gate_up.bias is None
+            and down.bias is None
+            and not down.reduce_results
+            and gate_up.weight.dtype == down.weight.dtype == torch.bfloat16
+        ):
+            return None
+        logger.info_once(
+            "Kimi-K3 MoE: shared expert runs inside AITER routed_chain.",
+            scope="global",
+        )
+        return gate_up.weight, down.weight, act.beta, act.linear_beta
+
     def _routed_chain(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None = None,
+    ):
+        """Routed output, or (routed, shared) outputs with shared_experts_input."""
         from aiter.ops.flydsl.moe_routed_chain import routed_chain
 
         quant_config = self._quant_method.moe_quant_config
+        shared = {}
+        if shared_experts_input is not None:
+            w_gu, w_dn, beta, linear_beta = self._chain_shared_weights
+            shared = dict(
+                shared_x=shared_experts_input.contiguous(),
+                shared_w_gu=w_gu,
+                shared_w_dn=w_dn,
+                shared_beta=beta,
+                shared_linear_beta=linear_beta,
+            )
         return routed_chain(
             router_logits.contiguous(),
             self.router.e_score_correction_bias.data,
@@ -212,7 +268,37 @@ class ROCmLatentMoERunner(MoERunner):
             topk=self.router.top_k,
             situ_beta=self.moe_config.activation_situ_beta,
             situ_linear_beta=self.moe_config.activation_situ_linear_beta,
+            **shared,
         )
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ):
+        """Small batches with a chain-able shared expert: one launch runs routing,
+        the routed experts and the shared expert, so the shared expert is not
+        forked to the aux stream."""
+        if (
+            shared_experts_input is None
+            or self._chain_shared_weights is None
+            or shared_experts_input.dtype != torch.bfloat16
+            or not self._use_routed_chain(hidden_states, router_logits)
+        ):
+            return super()._forward_impl(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            )
+        self.routed_experts._ensure_moe_quant_config_init()
+        with self._sequence_parallel_context():
+            hidden_states, router_logits = self._maybe_dispatch(
+                hidden_states, router_logits
+            )
+            fused_out, shared_out = self._routed_chain(
+                hidden_states, router_logits, shared_experts_input
+            )
+            return self._maybe_combine(shared_out, fused_out)
 
     def _apply_quant_method(
         self,
