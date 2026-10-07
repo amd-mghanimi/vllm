@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import time
 from functools import cached_property
 from typing import cast
 
@@ -30,6 +31,91 @@ logger = init_logger(__name__)
 # AITER's routed_chain takes M <= 32; past 16 tokens it loses more to the
 # four-launch path than it saves.
 _ROUTED_CHAIN_MAX_TOKENS = 16
+
+
+def _tensor_blob(t: torch.Tensor) -> dict:
+    """A tensor as raw bytes plus dtype, so fp4/e8m0 weights survive torch.save."""
+    t = t.detach()
+    return {
+        "bytes": t.contiguous().reshape(-1).view(torch.uint8).cpu(),
+        "dtype": str(t.dtype).removeprefix("torch."),
+        "shape": tuple(t.shape),
+        "contiguous": t.is_contiguous(),
+        "is_shuffled": getattr(t, "is_shuffled", None),
+    }
+
+
+class _MoERecorder:
+    """Debug: record the stock MoE path's inputs and outputs for offline replay.
+
+    Enabled by VLLM_ROCM_K3_RECORD=<dir> (eager mode only: copies to host).
+    Forces the stock path. For TP ranks in VLLM_ROCM_K3_RECORD_RANKS (default 0)
+    and layers in VLLM_ROCM_K3_RECORD_LAYERS (default 1,30,60) it writes the
+    layer's processed weights once, then every VLLM_ROCM_K3_RECORD_EVERY-th
+    call with at most VLLM_ROCM_K3_RECORD_MAX_TOKENS tokens, up to
+    VLLM_ROCM_K3_RECORD_MAX calls per layer, in chunks of 64 calls.
+    """
+
+    CHUNK = 64
+
+    def __init__(self, root: str):
+        env = os.environ.get
+        self.root = root
+        self.layers = {int(v) for v in env("VLLM_ROCM_K3_RECORD_LAYERS", "1,30,60").split(",")}
+        self.ranks = {int(v) for v in env("VLLM_ROCM_K3_RECORD_RANKS", "0").split(",")}
+        self.every = int(env("VLLM_ROCM_K3_RECORD_EVERY", "1"))
+        self.max_calls = int(env("VLLM_ROCM_K3_RECORD_MAX", "2048"))
+        self.max_tokens = int(env("VLLM_ROCM_K3_RECORD_MAX_TOKENS", "32"))
+        self.seen: dict[int, int] = {}
+        self.saved: dict[int, int] = {}
+        self.buf: dict[int, list] = {}
+
+    def layer_dir(self, layer: int) -> str:
+        rank = get_tensor_model_parallel_rank()
+        path = os.path.join(self.root, f"rank{rank}", f"layer{layer:02d}")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def wants(self, layer: int | None, m: int) -> bool:
+        if (
+            layer is None
+            or layer not in self.layers
+            or get_tensor_model_parallel_rank() not in self.ranks
+            or m > self.max_tokens
+            or self.saved.get(layer, 0) >= self.max_calls
+        ):
+            return False
+        n = self.seen.get(layer, 0)
+        self.seen[layer] = n + 1
+        return n % self.every == 0
+
+    def save_weights(self, layer: int, weights: dict) -> None:
+        path = os.path.join(self.layer_dir(layer), "weights.pt")
+        if not os.path.exists(path):
+            torch.save(
+                {k: _tensor_blob(v) if isinstance(v, torch.Tensor) else v
+                 for k, v in weights.items()},
+                path,
+            )
+            logger.info("K3 MoE record: weights of layer %d -> %s", layer, path)
+
+    def add(self, layer: int, rec: dict) -> None:
+        rec = {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+               for k, v in rec.items()}
+        buf = self.buf.setdefault(layer, [])
+        buf.append(rec)
+        self.saved[layer] = self.saved.get(layer, 0) + 1
+        if len(buf) == self.CHUNK or self.saved[layer] == self.max_calls:
+            n = (self.saved[layer] - 1) // self.CHUNK
+            torch.save(buf, os.path.join(self.layer_dir(layer), f"calls_{n:05d}.pt"))
+            buf.clear()
+
+
+_RECORDER = (
+    _MoERecorder(os.environ["VLLM_ROCM_K3_RECORD"])
+    if os.environ.get("VLLM_ROCM_K3_RECORD")
+    else None
+)
 
 
 class ROCmLatentMoERunner(MoERunner):
@@ -176,7 +262,8 @@ class ROCmLatentMoERunner(MoERunner):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ) -> bool:
         if (
-            not self._routed_chain_layer_ok
+            _RECORDER is not None
+            or not self._routed_chain_layer_ok
             or self.router.capture_fn is not None
             or hidden_states.shape[0] > _ROUTED_CHAIN_MAX_TOKENS
         ):
@@ -213,6 +300,17 @@ class ROCmLatentMoERunner(MoERunner):
             from aiter.ops.flydsl.moe_routed_chain import shared_supported  # noqa: F401
         except ImportError:
             return None
+        weights = self._shared_mlp_weights
+        if weights is not None:
+            logger.info_once(
+                "Kimi-K3 MoE: shared expert runs inside AITER routed_chain.",
+                scope="global",
+            )
+        return weights
+
+    @cached_property
+    def _shared_mlp_weights(self) -> tuple | None:
+        """(gate_up weight, down weight, beta, linear_beta) of a KimiMLP shared expert."""
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
         mlp = getattr(self._shared_experts, "_layer", None)
@@ -231,11 +329,59 @@ class ROCmLatentMoERunner(MoERunner):
             and gate_up.weight.dtype == down.weight.dtype == torch.bfloat16
         ):
             return None
-        logger.info_once(
-            "Kimi-K3 MoE: shared expert runs inside AITER routed_chain.",
-            scope="global",
-        )
         return gate_up.weight, down.weight, act.beta, act.linear_beta
+
+    @cached_property
+    def _layer_index(self) -> int | None:
+        parts = [p for p in str(getattr(self, "layer_name", "")).split(".") if p.isdigit()]
+        return int(parts[0]) if parts else None
+
+    def _record_weights(self) -> dict:
+        quant_config = self._quant_method.moe_quant_config
+        weights = dict(
+            layer_name=str(self.layer_name),
+            w13=self.routed_experts.w13_weight,
+            w2=self.routed_experts.w2_weight,
+            w1_scale=quant_config.w1_scale,
+            w2_scale=quant_config.w2_scale,
+            bias=self.router.e_score_correction_bias.data,
+            topk=self.router.top_k,
+            situ_beta=self.moe_config.activation_situ_beta,
+            situ_linear_beta=self.moe_config.activation_situ_linear_beta,
+            chain_layer_ok=self._routed_chain_layer_ok,
+        )
+        if self._shared_mlp_weights is not None:
+            w_gu, w_dn, beta, linear_beta = self._shared_mlp_weights
+            weights.update(shared_w_gu=w_gu, shared_w_dn=w_dn, shared_beta=beta,
+                           shared_linear_beta=linear_beta)
+        return weights
+
+    def _recorded_forward_impl(
+        self, hidden_states, router_logits, shared_experts_input, input_ids
+    ):
+        """The stock path, with its inputs and outputs saved for offline replay."""
+        layer = self._layer_index
+        assert _RECORDER is not None
+        if not _RECORDER.wants(layer, hidden_states.shape[0]):
+            return super()._forward_impl(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            )
+        _RECORDER.save_weights(layer, self._record_weights())
+        rec = dict(
+            t=time.time(),
+            m=hidden_states.shape[0],
+            x=hidden_states.clone(),
+            logits=router_logits.clone(),
+            shared_x=None if shared_experts_input is None else shared_experts_input.clone(),
+        )
+        result = super()._forward_impl(
+            hidden_states, router_logits, shared_experts_input, input_ids
+        )
+        shared_out, fused_out = result if isinstance(result, tuple) else (None, result)
+        if isinstance(fused_out, torch.Tensor):
+            rec.update(fused_out=fused_out, shared_out=shared_out)
+            _RECORDER.add(layer, rec)
+        return result
 
     def _routed_chain(
         self,
@@ -281,6 +427,10 @@ class ROCmLatentMoERunner(MoERunner):
         """Small batches with a chain-able shared expert: one launch runs routing,
         the routed experts and the shared expert, so the shared expert is not
         forked to the aux stream."""
+        if _RECORDER is not None:
+            return self._recorded_forward_impl(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            )
         if (
             shared_experts_input is None
             or self._chain_shared_weights is None
