@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -62,7 +63,9 @@ class _MoERecorder:
     def __init__(self, root: str):
         env = os.environ.get
         self.root = root
-        self.layers = {int(v) for v in env("VLLM_ROCM_K3_RECORD_LAYERS", "1,30,60").split(",")}
+        self.layers = {
+            int(v) for v in env("VLLM_ROCM_K3_RECORD_LAYERS", "1,30,60").split(",")
+        }
         self.ranks = {int(v) for v in env("VLLM_ROCM_K3_RECORD_RANKS", "0").split(",")}
         self.every = int(env("VLLM_ROCM_K3_RECORD_EVERY", "1"))
         self.max_calls = int(env("VLLM_ROCM_K3_RECORD_MAX", "2048"))
@@ -94,15 +97,19 @@ class _MoERecorder:
         path = os.path.join(self.layer_dir(layer), "weights.pt")
         if not os.path.exists(path):
             torch.save(
-                {k: _tensor_blob(v) if isinstance(v, torch.Tensor) else v
-                 for k, v in weights.items()},
+                {
+                    k: _tensor_blob(v) if isinstance(v, torch.Tensor) else v
+                    for k, v in weights.items()
+                },
                 path,
             )
             logger.info("K3 MoE record: weights of layer %d -> %s", layer, path)
 
     def add(self, layer: int, rec: dict) -> None:
-        rec = {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
-               for k, v in rec.items()}
+        rec = {
+            k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+            for k, v in rec.items()
+        }
         buf = self.buf.setdefault(layer, [])
         buf.append(rec)
         self.saved[layer] = self.saved.get(layer, 0) + 1
@@ -121,8 +128,11 @@ class _AiterSpy:
     TARGETS = (("aiter", "biased_grouped_topk"), ("aiter.fused_moe", "fused_moe"))
 
     def __init__(self, named: dict):
-        self.ptrs = {(t.data_ptr(), tuple(t.shape), t.dtype): n
-                     for n, t in named.items() if isinstance(t, torch.Tensor)}
+        self.ptrs = {
+            (t.data_ptr(), tuple(t.shape), t.dtype): n
+            for n, t in named.items()
+            if isinstance(t, torch.Tensor)
+        }
         self.calls: list[dict] = []
 
     def _arg(self, v, op: int, slot: str):
@@ -151,18 +161,26 @@ class _AiterSpy:
 
             def spy(*args, _orig=orig, _name=f"{mod}.{attr}", **kwargs):
                 op = len(self.calls)
-                self.calls.append({
-                    "fn": _name,
-                    "args": [self._arg(v, op, str(i)) for i, v in enumerate(args)],
-                    "kwargs": {k: self._arg(v, op, k) for k, v in kwargs.items()},
-                })
+                self.calls.append(
+                    {
+                        "fn": _name,
+                        "args": [self._arg(v, op, str(i)) for i, v in enumerate(args)],
+                        "kwargs": {k: self._arg(v, op, k) for k, v in kwargs.items()},
+                    }
+                )
                 out = _orig(*args, **kwargs)
                 outs = out if isinstance(out, tuple) else (out,)
                 for i, o in enumerate(outs):
                     if isinstance(o, torch.Tensor):
-                        self.ptrs.setdefault((o.data_ptr(), tuple(o.shape), o.dtype), f"op{op}:out{i}")
-                self.calls[-1]["out"] = [self.ptrs.get((o.data_ptr(), tuple(o.shape), o.dtype))
-                                         if isinstance(o, torch.Tensor) else None for o in outs]
+                        self.ptrs.setdefault(
+                            (o.data_ptr(), tuple(o.shape), o.dtype), f"op{op}:out{i}"
+                        )
+                self.calls[-1]["out"] = [
+                    self.ptrs.get((o.data_ptr(), tuple(o.shape), o.dtype))
+                    if isinstance(o, torch.Tensor)
+                    else None
+                    for o in outs
+                ]
                 return out
 
             setattr(m, attr, spy)
@@ -195,7 +213,16 @@ class _GraphProbe:
 
     RING = 4096
     MAX_M = 32
-    EV = ("seq", "layer", "m", "bad_logit_rows", "first_bad", "last_bad", "bad_x_rows", "bad_id_rows")
+    EV = (
+        "seq",
+        "layer",
+        "m",
+        "bad_logit_rows",
+        "first_bad",
+        "last_bad",
+        "bad_x_rows",
+        "bad_id_rows",
+    )
 
     def __init__(self, root: str):
         self.root = root
@@ -210,13 +237,17 @@ class _GraphProbe:
 
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o666)
         os.ftruncate(fd, n * 8)
-        self._mm = mmap.mmap(fd, n * 8, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        self._mm = mmap.mmap(
+            fd, n * 8, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+        )
         host = torch.frombuffer(self._mm, dtype=torch.int64)
 
         class _Iface:
             __cuda_array_interface__ = {
-                "shape": (n,), "typestr": "<i8",
-                "data": (host.data_ptr(), False), "version": 3,
+                "shape": (n,),
+                "typestr": "<i8",
+                "data": (host.data_ptr(), False),
+                "version": 3,
             }
 
         # as_tensor silently copies (and the probe sees nothing) unless the
@@ -233,10 +264,15 @@ class _GraphProbe:
         self.dir = os.path.join(self.root, f"rank{get_tensor_model_parallel_rank()}")
         os.makedirs(self.dir, exist_ok=True)
         nf = len(self.EV)
-        host, dev = self._mapped(os.path.join(self.dir, "ring.bin"), 2 + self.RING * nf, device)
+        host, dev = self._mapped(
+            os.path.join(self.dir, "ring.bin"), 2 + self.RING * nf, device
+        )
         self.h_calls, self.calls = host[0:1], dev[0:1]
         self.h_n_ev, self.n_ev = host[1:2], dev[1:2]
-        self.h_ring, self.ring = host[2:].view(self.RING, nf), dev[2:].view(self.RING, nf)
+        self.h_ring, self.ring = (
+            host[2:].view(self.RING, nf),
+            dev[2:].view(self.RING, nf),
+        )
         self.snap_lg = torch.zeros(128, self.MAX_M, ne, **z)
         self.snap_x = torch.zeros(128, self.MAX_M, hidden, dtype=torch.bfloat16, **z)
         self.snap_meta = torch.full((128, 2), -1, dtype=torch.int64, **z)
@@ -251,8 +287,14 @@ class _GraphProbe:
         last = torch.where(bad, r, -1).max()
         return first, last
 
-    def check(self, layer: int | None, logits: torch.Tensor, x: torch.Tensor,
-              ids: torch.Tensor | None = None, ne: int = 0) -> None:
+    def check(
+        self,
+        layer: int | None,
+        logits: torch.Tensor,
+        x: torch.Tensor,
+        ids: torch.Tensor | None = None,
+        ne: int = 0,
+    ) -> None:
         """Inputs (ids None, before the MoE) or the chain's expert ids (after it)."""
         m = logits.shape[0]
         if layer is None or m > self.MAX_M:
@@ -271,20 +313,36 @@ class _GraphProbe:
         first, last = self._rows_span(bad_lg | bad_x | bad_id, m)
         any_bad = (bad_lg | bad_x | bad_id).any()
         seq = self.calls.clone()
-        ev = torch.stack([
-            seq[0], torch.full_like(seq[0], layer), torch.full_like(seq[0], m),
-            bad_lg.sum(), first, last, bad_x.sum(), bad_id.sum(),
-        ])
+        ev = torch.stack(
+            [
+                seq[0],
+                torch.full_like(seq[0], layer),
+                torch.full_like(seq[0], m),
+                bad_lg.sum(),
+                first,
+                last,
+                bad_x.sum(),
+                bad_id.sum(),
+            ]
+        )
         slot = self.n_ev % self.RING
-        self.ring.index_copy_(0, slot, torch.where(any_bad, ev, self.ring[slot][0]).unsqueeze(0))
+        self.ring.index_copy_(
+            0, slot, torch.where(any_bad, ev, self.ring[slot][0]).unsqueeze(0)
+        )
         self.n_ev.add_(any_bad.long())
         if ids is None:
             self.calls.add_(1)
         if ids is None and layer < self.snap_meta.shape[0]:
-            self.snap_lg[layer, :m].copy_(torch.where(any_bad, logits, self.snap_lg[layer, :m]))
-            self.snap_x[layer, :m].copy_(torch.where(any_bad, x, self.snap_x[layer, :m]))
+            self.snap_lg[layer, :m].copy_(
+                torch.where(any_bad, logits, self.snap_lg[layer, :m])
+            )
+            self.snap_x[layer, :m].copy_(
+                torch.where(any_bad, x, self.snap_x[layer, :m])
+            )
             meta = torch.stack([seq[0], torch.full_like(seq[0], m)])
-            self.snap_meta[layer].copy_(torch.where(any_bad, meta, self.snap_meta[layer]))
+            self.snap_meta[layer].copy_(
+                torch.where(any_bad, meta, self.snap_meta[layer])
+            )
 
     def _drain(self) -> None:
         stream = torch.cuda.Stream(device=self.calls.device)
@@ -298,15 +356,23 @@ class _GraphProbe:
             if n == done:
                 continue
             ring = self.h_ring.clone()
-            new = [ring[i % self.RING].tolist() for i in range(max(done, n - self.RING), n)]
+            new = [
+                ring[i % self.RING].tolist() for i in range(max(done, n - self.RING), n)
+            ]
             for ev in new[:32]:
-                logger.warning("K3 MoE probe event: %s (calls so far %d)",
-                               dict(zip(self.EV, ev)), calls)
+                logger.warning(
+                    "K3 MoE probe event: %s (calls so far %d)",
+                    dict(zip(self.EV, ev)),
+                    calls,
+                )
             out = {"events": new, "fields": self.EV, "calls": calls}
             torch.save(out, os.path.join(self.dir, f"events_{n:08d}.pt"))
             with torch.cuda.stream(stream):
-                out.update(snap_logits=self.snap_lg.cpu(), snap_x=self.snap_x.cpu(),
-                           snap_meta=self.snap_meta.cpu())
+                out.update(
+                    snap_logits=self.snap_lg.cpu(),
+                    snap_x=self.snap_x.cpu(),
+                    snap_meta=self.snap_meta.cpu(),
+                )
             torch.save(out, os.path.join(self.dir, f"events_{n:08d}.pt"))
             done = n
 
@@ -405,11 +471,12 @@ class ROCmLatentMoERunner(MoERunner):
         a4w4 SiTUv2 MoE on [gate; up] a16w4-shuffled weights, with no EP, bias
         or padding. Read on the first forward, after weights are processed.
         """
+        if not (envs.VLLM_ROCM_MONO_DECODE and current_platform.is_rocm()):
+            return False
         from vllm.platforms.rocm import on_gfx950
 
         if not (
-            envs.VLLM_ROCM_MONO_DECODE
-            and on_gfx950()
+            on_gfx950()
             and rocm_aiter_ops.is_fused_moe_enabled()
             and rocm_aiter_ops.get_fused_moe_situv2_activation() == "a4w4"
         ):
@@ -547,7 +614,9 @@ class ROCmLatentMoERunner(MoERunner):
 
     @cached_property
     def _layer_index(self) -> int | None:
-        parts = [p for p in str(getattr(self, "layer_name", "")).split(".") if p.isdigit()]
+        parts = [
+            p for p in str(getattr(self, "layer_name", "")).split(".") if p.isdigit()
+        ]
         return int(parts[0]) if parts else None
 
     def _record_weights(self) -> dict:
@@ -566,8 +635,12 @@ class ROCmLatentMoERunner(MoERunner):
         )
         if self._shared_mlp_weights is not None:
             w_gu, w_dn, beta, linear_beta = self._shared_mlp_weights
-            weights.update(shared_w_gu=w_gu, shared_w_dn=w_dn, shared_beta=beta,
-                           shared_linear_beta=linear_beta)
+            weights.update(
+                shared_w_gu=w_gu,
+                shared_w_dn=w_dn,
+                shared_beta=beta,
+                shared_linear_beta=linear_beta,
+            )
         return weights
 
     def _recorded_forward_impl(
@@ -587,9 +660,13 @@ class ROCmLatentMoERunner(MoERunner):
             m=hidden_states.shape[0],
             x=hidden_states.clone(),
             logits=router_logits.clone(),
-            shared_x=None if shared_experts_input is None else shared_experts_input.clone(),
+            shared_x=None
+            if shared_experts_input is None
+            else shared_experts_input.clone(),
         )
-        spy_path = os.path.join(_RECORDER.layer_dir(layer), f"aiter_calls_m{rec['m']:02d}.pt")
+        spy_path = os.path.join(
+            _RECORDER.layer_dir(layer), f"aiter_calls_m{rec['m']:02d}.pt"
+        )
         if os.path.exists(spy_path):
             result = super()._forward_impl(
                 hidden_states, router_logits, shared_experts_input, input_ids
@@ -602,8 +679,13 @@ class ROCmLatentMoERunner(MoERunner):
                     hidden_states, router_logits, shared_experts_input, input_ids
                 )
             torch.save(spy.calls, spy_path)
-            logger.info("K3 MoE record: %d AITER calls of layer %d (m=%d) -> %s",
-                        len(spy.calls), layer, rec["m"], spy_path)
+            logger.info(
+                "K3 MoE record: %d AITER calls of layer %d (m=%d) -> %s",
+                len(spy.calls),
+                layer,
+                rec["m"],
+                spy_path,
+            )
         shared_out, fused_out = result if isinstance(result, tuple) else (None, result)
         if isinstance(fused_out, torch.Tensor):
             rec.update(fused_out=fused_out, shared_out=shared_out)
@@ -632,8 +714,10 @@ class ROCmLatentMoERunner(MoERunner):
             )
         if _PROBE is not None:
             shared["topk_ids"] = torch.empty(
-                hidden_states.shape[0], self.router.top_k,
-                dtype=torch.int32, device=hidden_states.device,
+                hidden_states.shape[0],
+                self.router.top_k,
+                dtype=torch.int32,
+                device=hidden_states.device,
             )
         res = mono_moe(
             router_logits.contiguous(),
@@ -649,8 +733,13 @@ class ROCmLatentMoERunner(MoERunner):
             **shared,
         )
         if _PROBE is not None:
-            _PROBE.check(self._layer_index, router_logits, hidden_states,
-                         ids=shared["topk_ids"], ne=self.routed_experts.w13_weight.shape[0])
+            _PROBE.check(
+                self._layer_index,
+                router_logits,
+                hidden_states,
+                ids=shared["topk_ids"],
+                ne=self.routed_experts.w13_weight.shape[0],
+            )
         return res
 
     def _forward_impl(

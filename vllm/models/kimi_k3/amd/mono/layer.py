@@ -359,8 +359,10 @@ def compile_mono_moe(
                         False,
                     )  # fmt: skip
                     mark(t, 2)
-                if const_expr(SH_INTER):
-                    if wk >= n_g1:
+                # Traced conditions: nested ifs, as `and` would short-circuit
+                # on the host.
+                if const_expr(SH_INTER):  # noqa: SIM102
+                    if wk >= n_g1:  # noqa: SIM102
                         if wk < g2_0:
                             mark(t, 1)
                             shared_down(
@@ -394,7 +396,7 @@ def compile_mono_moe(
                 ctrl32 = global_typed_ptr(arg_ws, T.i32)
                 for i in range(tid, mb_max, fx.Int32(THREADS)):
                     ctrl32[fx.Int32(W_MBLOCK) + i * fx.Int32(MB_STRIDE)] = fx.Int32(0)
-                if const_expr(SH_INTER):
+                if const_expr(SH_INTER):  # noqa: SIM102
                     if tid <= fx.Int32(sh_pairs(SH_INTER)):
                         ctrl32[fx.Int32(W_SH_PAIR) + tid * fx.Int32(MB_STRIDE)] = (
                             fx.Int32(0)
@@ -427,10 +429,27 @@ def compile_mono_moe(
             stream: fx.Stream,
         ):
             mono_moe_kernel(
-                arg_logits, arg_bias, arg_x, arg_w1, arg_w1s, arg_w2, arg_w2s,
-                arg_out, arg_tw, arg_ti, arg_ws, arg_sh_x, arg_sh_wgu, arg_sh_wdn,
-                arg_sh_out, arg_trace, i32_M, i32_grid,
-            ).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(THREADS, 1, 1), stream=stream)  # fmt: skip
+                arg_logits,
+                arg_bias,
+                arg_x,
+                arg_w1,
+                arg_w1s,
+                arg_w2,
+                arg_w2s,
+                arg_out,
+                arg_tw,
+                arg_ti,
+                arg_ws,
+                arg_sh_x,
+                arg_sh_wgu,
+                arg_sh_wdn,
+                arg_sh_out,
+                arg_trace,
+                i32_M,
+                i32_grid,
+            ).launch(
+                grid=(fx.Int64(i32_grid), 1, 1), block=(THREADS, 1, 1), stream=stream
+            )
 
         return launch_mono_moe
 

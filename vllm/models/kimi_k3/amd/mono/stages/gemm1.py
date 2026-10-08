@@ -3,6 +3,7 @@
 # Adapted from ROCm/aiter (https://github.com/ROCm/aiter) v0.1.24.post1,
 # Apache-2.0, Copyright (C) 2025-2026 FlyDSL Project Contributors:
 # aiter/ops/flydsl/kernels/mxfp4_gemm1.py (_gemm1_body)
+# ruff: noqa: E501, SIM108
 """gemm1 tile of the mono MoE launch: AITER's a4w4 stage-1 body (MXFP4 x MXFP4,
 inline quant of x, SiTUv2, the MXFP4 intermediate and its scales out).
 
