@@ -134,7 +134,7 @@ class _AiterSpy:
                 name = f"op{op}:{slot}"
                 self.ptrs[key] = name
                 return ("tensor", name, _tensor_blob(v))
-            return ("ref", name)
+            return ("ref", name, {"is_shuffled": getattr(v, "is_shuffled", None)})
         if isinstance(v, enum.Enum):
             return ("enum", type(v).__name__, v.value)
         return ("value", v)
