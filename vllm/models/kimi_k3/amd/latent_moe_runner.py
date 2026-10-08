@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopKRouter,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.models.kimi_k3.amd import moe_probe, moe_record
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -187,6 +188,7 @@ class ROCmLatentMoERunner(MoERunner):
     ) -> bool:
         if (
             shared_experts_input is None
+            or moe_record.RECORDER is not None
             or not self._mono_layer_ok
             or self.router.capture_fn is not None
             or hidden_states.dtype != torch.bfloat16
@@ -242,7 +244,15 @@ class ROCmLatentMoERunner(MoERunner):
 
         quant_config = self._quant_method.moe_quant_config
         w_gu, w_dn, beta, linear_beta = self._shared_mlp_weights
-        return mono_moe(
+        ids = None
+        if moe_probe.PROBE is not None:
+            ids = torch.empty(
+                hidden_states.shape[0],
+                self.router.top_k,
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+        res = mono_moe(
             router_logits.contiguous(),
             self.router.e_score_correction_bias.data,
             hidden_states.contiguous(),
@@ -258,7 +268,17 @@ class ROCmLatentMoERunner(MoERunner):
             situ_linear_beta=self.moe_config.activation_situ_linear_beta,
             shared_beta=beta,
             shared_linear_beta=linear_beta,
+            topk_ids=ids,
         )
+        if moe_probe.PROBE is not None:
+            moe_probe.PROBE.check(
+                moe_record.layer_index(self),
+                router_logits,
+                hidden_states,
+                ids=ids,
+                ne=self.routed_experts.w13_weight.shape[0],
+            )
+        return res
 
     def _forward_impl(
         self,
@@ -270,6 +290,19 @@ class ROCmLatentMoERunner(MoERunner):
         """Small decode batches: one launch runs routing, the routed experts and
         the shared expert, so the shared expert is not forked to the aux stream.
         Everything else takes the base runner's multi-kernel path."""
+        if moe_probe.PROBE is not None:
+            moe_probe.PROBE.check(
+                moe_record.layer_index(self), router_logits, hidden_states
+            )
+        if moe_record.RECORDER is not None:
+            return moe_record.recorded_forward_impl(
+                self,
+                super()._forward_impl,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
         if not self._use_mono(hidden_states, router_logits, shared_experts_input):
             return super()._forward_impl(
                 hidden_states, router_logits, shared_experts_input, input_ids
