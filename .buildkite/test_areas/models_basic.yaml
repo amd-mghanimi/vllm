@@ -255,9 +255,11 @@ steps:
   - tests/models/test_dspark_mla.py
   - tests/models/transformers/test_layer_registry.py
   - tests/models/test_kimi_k3_mono_gate.py
+  - tests/models/test_kimi_k3_moe_record.py
+  - vllm/models/kimi_k3/amd/moe_record.py
   device: cpu-small
   commands:
-    - pytest -v -s models/test_utils.py models/test_vision.py models/test_adapters.py models/test_qwen3_5_mtp_config.py models/transformers/fusers/ model_executor/layers/test_activation.py models/test_language_model_cache_is_weak.py models/deepseek_v32/test_sequence_parallel.py models/test_deepseek_v4_fi_moe_ep.py models/test_dspark_mla.py models/transformers/test_layer_registry.py models/test_kimi_k3_mono_gate.py
+    - pytest -v -s models/test_utils.py models/test_vision.py models/test_adapters.py models/test_qwen3_5_mtp_config.py models/transformers/fusers/ model_executor/layers/test_activation.py models/test_language_model_cache_is_weak.py models/deepseek_v32/test_sequence_parallel.py models/test_deepseek_v4_fi_moe_ep.py models/test_dspark_mla.py models/transformers/test_layer_registry.py models/test_kimi_k3_mono_gate.py models/test_kimi_k3_moe_record.py
 
 - label: ':amd: (MI355) Kimi-K3 Mono MoE Numerics'
   key: kimi-k3-mono-moe-numerics-amd
