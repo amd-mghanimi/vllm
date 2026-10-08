@@ -150,8 +150,6 @@ class _GraphProbe:
         os.ftruncate(fd, n * 8)
         self._mm = mmap.mmap(fd, n * 8, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
         host = torch.frombuffer(self._mm, dtype=torch.int64)
-        rc = torch.cuda.cudart().cudaHostRegister(host.data_ptr(), n * 8, 2)
-        assert int(rc) == 0, f"K3 MoE probe: hostRegister failed ({rc})"
 
         class _Iface:
             __cuda_array_interface__ = {
@@ -159,7 +157,14 @@ class _GraphProbe:
                 "data": (host.data_ptr(), False), "version": 3,
             }
 
-        return host, torch.as_tensor(_Iface(), device=device)
+        # as_tensor silently copies (and the probe sees nothing) unless the
+        # pointer resolves to `device`, so register and wrap with it current.
+        with torch.cuda.device(device):
+            rc = torch.cuda.cudart().cudaHostRegister(host.data_ptr(), n * 8, 3)
+            assert int(rc) == 0, f"K3 MoE probe: hostRegister failed ({rc})"
+            dev = torch.as_tensor(_Iface(), device=device)
+        assert dev.data_ptr() == host.data_ptr(), "K3 MoE probe: device view is a copy"
+        return host, dev
 
     def _alloc(self, device, ne: int, hidden: int) -> None:
         z = dict(device=device)
