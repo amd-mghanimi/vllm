@@ -7,6 +7,7 @@ from typing import cast
 
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -28,9 +29,9 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
 
 logger = init_logger(__name__)
 
-# AITER's routed_chain takes M <= 32; past 16 tokens it loses more to the
+# The mono MoE launch takes M <= 32; past 16 tokens it loses more to the
 # four-launch path than it saves.
-_ROUTED_CHAIN_MAX_TOKENS = 16
+_MONO_MOE_MAX_TOKENS = 16
 
 
 def _tensor_blob(t: torch.Tensor) -> dict:
@@ -315,7 +316,8 @@ _PROBE = (
     if os.environ.get("VLLM_ROCM_K3_PROBE")
     else None
 )
-_CHAIN_ON = os.environ.get("VLLM_ROCM_K3_CHAIN", "1") == "1"
+# Debug: keep the shared expert out of the mono MoE launch.
+_MONO_SHARED = os.environ.get("VLLM_ROCM_K3_MONO_SHARED", "1") == "1"
 
 
 class ROCmLatentMoERunner(MoERunner):
@@ -396,20 +398,29 @@ class ROCmLatentMoERunner(MoERunner):
 
     @cached_property
     def _routed_chain_layer_ok(self) -> bool:
-        """Whether this layer's routing and experts match AITER's routed_chain.
+        """Whether this layer's routing and experts match the mono MoE launch
+        (VLLM_ROCM_MONO_DECODE=1, gfx950).
 
-        routed_chain is biased sigmoid top-k, renormalised and unscaled, then the
+        The launch is biased sigmoid top-k, renormalised and unscaled, then the
         a4w4 SiTUv2 MoE on [gate; up] a16w4-shuffled weights, with no EP, bias
         or padding. Read on the first forward, after weights are processed.
         """
+        from vllm.platforms.rocm import on_gfx950
+
         if not (
-            rocm_aiter_ops.is_fused_moe_enabled()
+            envs.VLLM_ROCM_MONO_DECODE
+            and on_gfx950()
+            and rocm_aiter_ops.is_fused_moe_enabled()
             and rocm_aiter_ops.get_fused_moe_situv2_activation() == "a4w4"
         ):
             return False
         try:
-            from aiter.ops.flydsl.moe_routed_chain import routed_chain  # noqa: F401
+            from vllm.models.kimi_k3.amd.mono import runner  # noqa: F401
         except ImportError:
+            logger.warning_once(
+                "Kimi-K3 mono MoE needs FlyDSL and AITER's FlyDSL kernels; "
+                "running the multi-kernel MoE."
+            )
             return False
         quant_method = self._quant_method
         router = self.router
@@ -452,7 +463,7 @@ class ROCmLatentMoERunner(MoERunner):
         )
         if ok:
             logger.info_once(
-                "Kimi-K3 MoE: AITER routed_chain (top-k + a4w4 MoE in one launch) "
+                "Kimi-K3 MoE: mono MoE launch (top-k + a4w4 MoE in one launch) "
                 "for small batches.",
                 scope="global",
             )
@@ -463,10 +474,9 @@ class ROCmLatentMoERunner(MoERunner):
     ) -> bool:
         if (
             _RECORDER is not None
-            or not _CHAIN_ON
             or not self._routed_chain_layer_ok
             or self.router.capture_fn is not None
-            or hidden_states.shape[0] > _ROUTED_CHAIN_MAX_TOKENS
+            or hidden_states.shape[0] > _MONO_MOE_MAX_TOKENS
         ):
             return False
         if (
@@ -474,40 +484,43 @@ class ROCmLatentMoERunner(MoERunner):
             or router_logits.dtype != torch.float32
         ):
             return False
-        from aiter.ops.flydsl.moe_routed_chain import fused_supported
+        from vllm.models.kimi_k3.amd.mono.runner import supported
 
         w13 = self.routed_experts.w13_weight
-        return fused_supported(
+        return supported(
             hidden_states.shape[0],
             w13.shape[0],
             self.router.top_k,
-            hidden_states.shape[1],
             w13.shape[1] // 2,
         )
 
     @cached_property
     def _chain_shared_weights(self) -> tuple | None:
-        """(gate_up weight, down weight, beta, linear_beta) when routed_chain can run
-        this layer's shared expert in the same launch (VLLM_ROCM_K3_CHAIN_SHARED=1).
+        """(gate_up weight, down weight, beta, linear_beta) when the mono MoE launch
+        can run this layer's shared expert too.
 
         The shared expert must be KimiMLP as vLLM builds it for K3: unquantized bf16,
         no bias, SiTU, and an unreduced down projection (the tail reduces it).
         """
-        if os.environ.get("VLLM_ROCM_K3_CHAIN_SHARED", "0") != "1":
-            return None
-        if not self._routed_chain_layer_ok or self.gate is not None:
-            return None
-        try:
-            from aiter.ops.flydsl.moe_routed_chain import shared_supported  # noqa: F401
-        except ImportError:
+        if not _MONO_SHARED or not self._routed_chain_layer_ok or self.gate is not None:
             return None
         weights = self._shared_mlp_weights
         if weights is not None:
             logger.info_once(
-                "Kimi-K3 MoE: shared expert runs inside AITER routed_chain.",
+                "Kimi-K3 MoE: shared expert runs inside the mono MoE launch.",
                 scope="global",
             )
         return weights
+
+    def _chain_takes_shared(self, shared_experts_input: torch.Tensor | None) -> bool:
+        if shared_experts_input is None or self._chain_shared_weights is None:
+            return False
+        from vllm.models.kimi_k3.amd.mono.runner import shared_supported
+
+        w_gu, w_dn, _, _ = self._chain_shared_weights
+        return shared_supported(
+            shared_experts_input.shape[0], shared_experts_input, w_gu, w_dn
+        )
 
     @cached_property
     def _shared_mlp_weights(self) -> tuple | None:
@@ -604,14 +617,14 @@ class ROCmLatentMoERunner(MoERunner):
         shared_experts_input: torch.Tensor | None = None,
     ):
         """Routed output, or (routed, shared) outputs with shared_experts_input."""
-        from aiter.ops.flydsl.moe_routed_chain import routed_chain
+        from vllm.models.kimi_k3.amd.mono.runner import mono_moe
 
         quant_config = self._quant_method.moe_quant_config
         shared = {}
         if shared_experts_input is not None:
             w_gu, w_dn, beta, linear_beta = self._chain_shared_weights
             shared = dict(
-                shared_x=shared_experts_input.contiguous(),
+                shared_x=shared_experts_input,
                 shared_w_gu=w_gu,
                 shared_w_dn=w_dn,
                 shared_beta=beta,
@@ -622,7 +635,7 @@ class ROCmLatentMoERunner(MoERunner):
                 hidden_states.shape[0], self.router.top_k,
                 dtype=torch.int32, device=hidden_states.device,
             )
-        res = routed_chain(
+        res = mono_moe(
             router_logits.contiguous(),
             self.router.e_score_correction_bias.data,
             hidden_states.contiguous(),
@@ -656,11 +669,9 @@ class ROCmLatentMoERunner(MoERunner):
             return self._recorded_forward_impl(
                 hidden_states, router_logits, shared_experts_input, input_ids
             )
-        if (
-            shared_experts_input is None
-            or self._chain_shared_weights is None
-            or shared_experts_input.dtype != torch.bfloat16
-            or not self._use_routed_chain(hidden_states, router_logits)
+        if not (
+            self._use_routed_chain(hidden_states, router_logits)
+            and self._chain_takes_shared(shared_experts_input)
         ):
             return super()._forward_impl(
                 hidden_states, router_logits, shared_experts_input, input_ids
@@ -683,7 +694,7 @@ class ROCmLatentMoERunner(MoERunner):
         input_ids: torch.Tensor | None = None,
         shared_experts_overlapping: bool = False,
     ):
-        """Small batches run routing and the routed experts as one AITER launch.
+        """Small batches run routing and the routed experts as one mono MoE launch.
 
         Shared experts run exactly as in the base runner; only the router's
         select_experts and the quant method's experts call are replaced.
