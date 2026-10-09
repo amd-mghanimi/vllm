@@ -25,7 +25,7 @@ routing.
   limit, and whose shared expert is KimiMLP as vLLM builds it (unquantized
   bf16, SiTU, unreduced down projection)
   (`ROCmLatentMoERunner._mono_layer_ok`).
-- Steps: M <= 16 tokens (`runner.M_MAX`, one m-block of the shared expert).
+- Steps: M <= 32 tokens (`runner.M_MAX`), compiled per 16-token bucket; the shared expert loops over the bucket's m-blocks.
   Larger steps take the multi-kernel path.
 - Contract: the same tensors as the path it replaces: in `x` [M, H] bf16,
   router logits [M, E] f32 and the correction bias; out the routed output
