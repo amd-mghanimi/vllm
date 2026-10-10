@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import replace
+from functools import cached_property
 
 import torch
 from einops import rearrange
@@ -45,6 +46,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.amd.kda_metadata import KimiK3ROCmKDABackend
+from vllm.models.kimi_k3.amd.mono_kda_decode import MonoKDA
 from vllm.models.kimi_k3.amd.ops.kda_checkpoint import (
     KimiK3ROCmKDAPrefillCheckpointExporter,
 )
@@ -308,11 +310,17 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
     def get_input_quant_key(self) -> QuantKey | None:
         return get_input_quant_key(self.in_proj_qkvgfab)
 
+    @cached_property
+    def _mono(self) -> MonoKDA:
+        return MonoKDA(self)
+
     def forward(
         self,
         hidden_states: torch.Tensor | QuantizedActivation,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        if (out := self._mono(hidden_states)) is not None:
+            return out
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
         num_tokens = projected_qkvgfab.shape[0]
 
