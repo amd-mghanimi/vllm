@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Which Kimi-K3 MoE calls take the mono MoE launch (CPU, no AITER needed).
 
-The runner's predicates are called on a stand-in object; the kernel module is
-replaced by a fake that records what it is asked about.
+``MonoLatentMoE`` is bound to a stand-in runner; the kernel module is replaced
+by a fake that records what it is asked about.
 """
 
 import sys
@@ -12,9 +12,8 @@ import types
 import pytest
 import torch
 
-from vllm.models.kimi_k3.amd import latent_moe_runner as lmr
+from vllm.models.kimi_k3.amd import mono_decode
 
-R = lmr.ROCmLatentMoERunner
 RUNNER = "vllm.models.kimi_k3.amd.mono.runner"
 HIDDEN, SH_HIDDEN, NE = 3584, 7168, 896
 
@@ -29,9 +28,10 @@ class _Experts:
 
 
 def _stub(layer_ok=True):
-    s = types.SimpleNamespace(router=_Router(), routed_experts=_Experts())
-    s._mono_layer_ok = layer_ok
-    s._shared_mlp_weights = (
+    r = types.SimpleNamespace(router=_Router(), routed_experts=_Experts())
+    s = mono_decode.MonoLatentMoE(r)
+    s.__dict__["layer_ok"] = layer_ok
+    s.__dict__["shared_mlp_weights"] = (
         torch.empty(1536, SH_HIDDEN, dtype=torch.bfloat16),
         torch.empty(SH_HIDDEN, 768, dtype=torch.bfloat16),
         4.0,
@@ -58,18 +58,18 @@ def _call(s, m, x_dtype=torch.bfloat16, logits_dtype=torch.float32, shared=True)
     x = torch.empty(m, HIDDEN, dtype=x_dtype)
     logits = torch.empty(m, NE, dtype=logits_dtype)
     shared_x = torch.empty(m, SH_HIDDEN, dtype=torch.bfloat16) if shared else None
-    return R._use_mono(s, x, logits, shared_x)
+    return s.eligible(x, logits, shared_x)
 
 
 def test_off_without_switch(monkeypatch):
     monkeypatch.delenv("VLLM_ROCM_MONO_DECODE", raising=False)
-    assert R._mono_layer_ok.func(_stub()) is False
+    assert mono_decode.MonoLatentMoE(types.SimpleNamespace()).layer_ok is False
 
 
 def test_off_on_other_platforms(monkeypatch):
     monkeypatch.setenv("VLLM_ROCM_MONO_DECODE", "1")
-    monkeypatch.setattr(lmr.current_platform, "is_rocm", lambda: False)
-    assert R._mono_layer_ok.func(_stub()) is False
+    monkeypatch.setattr(mono_decode.current_platform, "is_rocm", lambda: False)
+    assert mono_decode.MonoLatentMoE(types.SimpleNamespace()).layer_ok is False
 
 
 def test_small_decode_batches(fake_runner):
@@ -87,6 +87,6 @@ def test_declined(fake_runner):
     assert not _call(_stub(), 4, logits_dtype=torch.bfloat16)
     assert not _call(_stub(layer_ok=False), 4)
     s = _stub()
-    s.router.capture_fn = lambda *a: None
+    s.r.router.capture_fn = lambda *a: None
     assert not _call(s, 4)
     assert fake_runner == []

@@ -24,7 +24,7 @@ routing.
   EPLB / DP / sequence parallel, no expert bias, no padding and no swiglu
   limit, and whose shared expert is KimiMLP as vLLM builds it (unquantized
   bf16, SiTU, unreduced down projection)
-  (`ROCmLatentMoERunner._mono_layer_ok`).
+  (`mono_decode.MonoLatentMoE.layer_ok`).
 - Steps: M <= 16 tokens (`runner.M_MAX`, one m-block of the shared expert).
   Larger steps take the multi-kernel path.
 - Contract: the same tensors as the path it replaces: in `x` [M, H] bf16,
@@ -34,8 +34,9 @@ routing.
   Graph-safe: every argument is a fixed device pointer and the launch resets
   its own control words.
 
-## Layout
+## Launch
 
+    ../mono_decode.py  vLLM side: which layers and steps take the launch
     runner.py         launcher cache, workspace, mono_moe() (the host entry)
     layer.py          the launch: ticket loop over the stages below
     stages/route.py   top-k of one token, the expert sort
@@ -56,7 +57,7 @@ fails the compile if the body stops writing its outputs that way. The rest of
 AITER the launch uses (`buffer_ops`, `communication_ops_utils`,
 `mxfp4_gemm_common`, the gemm1 tile sizing) is imported unchanged.
 
-## The launch
+## Execution model and hand-offs
 
 Grid = min(work items, CUs), 256 threads, one workgroup a CU. Workgroups loop
 on a global ticket counter; the ticket picks the item:
@@ -82,7 +83,7 @@ on a global ticket counter; the ticket picks the item:
   2^30) and is never cleared; the workgroup that takes the last ticket clears
   the ticket, top-k and m-block counters for the next launch.
 
-## Numerics (the path each stage reproduces)
+## Numerics (the vLLM path each stage reproduces)
 
 - Top-k: AITER's `biased_grouped_topk` (one group): score = sigmoid(logit),
   select on score + bias, ties to the lower expert id, weights the selected
@@ -96,10 +97,10 @@ on a global ticket counter; the ticket picks the item:
 
 ## Validation
 
-- `tests/models/test_kimi_k3_mono_moe.py` (gfx950): against
+- `tests/models/kimi_k3/test_amd_mono_moe.py` (gfx950): against
   `biased_grouped_topk` + `fused_moe` and the KimiMLP math, M = 1..16, pooled
   and uniform routing, eager and two graph replays.
-- `tests/models/test_kimi_k3_mono_gate.py` (CPU): which calls take the launch.
+- `tests/models/kimi_k3/test_amd_mono_gate.py` (CPU): which calls take the launch.
 - Replays of recorded serving calls (real Kimi-K3 weights and decode inputs,
   per layer and M; the recorder and the replay benchmark are a separate change):
   outputs within the stock path's own run-to-run spread, device time under
