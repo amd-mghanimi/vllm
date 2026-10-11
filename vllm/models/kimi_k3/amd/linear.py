@@ -586,7 +586,7 @@ class KimiDecoderLayer(nn.Module):
 
         self._mono_kda: mono.MonoKda | None = None
         self._mono_k2: mono.MonoK2 | None = None
-        if self.use_attn_residuals and mono.enabled():
+        if self.use_attn_residuals and mono.enabled() and mono.parts() == "all":
             if config.is_kda_layer(layer_idx):
                 runner = mono.MonoKda(self)
                 self._mono_kda = runner if runner.ok else None

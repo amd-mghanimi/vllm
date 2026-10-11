@@ -58,6 +58,13 @@ def enabled() -> bool:
     return True
 
 
+def parts() -> str:
+    """K3_MONO_PARTS (local ablation): "all" (default) or "moe" (the MoE launch only)."""
+    import os
+
+    return os.environ.get("K3_MONO_PARTS", "all")
+
+
 def step_begin() -> None:
     runner.step_begin()
 
