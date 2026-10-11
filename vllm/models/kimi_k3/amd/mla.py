@@ -182,7 +182,7 @@ class KimiK3MultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     def forward_core(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor | QuantizedActivation,
+        hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The gated attention output: o_proj's input."""
