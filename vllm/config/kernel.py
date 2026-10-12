@@ -291,6 +291,11 @@ class KernelConfig:
     enable_jit_warmup: bool = True
     """If True, run JIT compile warmup during kernel warmup."""
 
+    monokernel: bool = False
+    """If True, run the eligible decode steps of a model that has MonoKernels
+    (persistent kernels running a decoder layer in one launch) on them. An
+    unsupported configuration is refused at startup."""
+
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
 

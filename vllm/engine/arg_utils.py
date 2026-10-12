@@ -544,6 +544,7 @@ class EngineArgs:
     )
     enable_ep_weight_filter: bool = ParallelConfig.enable_ep_weight_filter
     moe_backend: MoEBackend = KernelConfig.moe_backend
+    monokernel: bool = KernelConfig.monokernel
     linear_backend: LinearBackend = KernelConfig.linear_backend
     sparse_indexer_topk_backend: SparseIndexerTopkBackend = (
         KernelConfig.sparse_indexer_topk_backend
@@ -1794,6 +1795,7 @@ class EngineArgs:
         moe_backend_kwargs = kernel_kwargs["moe_backend"]
         moe_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
         kernel_group.add_argument("--moe-backend", **moe_backend_kwargs)
+        kernel_group.add_argument("--monokernel", **kernel_kwargs["monokernel"])
         linear_backend_kwargs = kernel_kwargs["linear_backend"]
         linear_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
         kernel_group.add_argument("--linear-backend", **linear_backend_kwargs)
@@ -2743,6 +2745,8 @@ class EngineArgs:
             kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
         if self.moe_backend != "auto":
             kernel_config.moe_backend = self.moe_backend
+        if self.monokernel:
+            kernel_config.monokernel = True
         if self.linear_backend != "auto":
             kernel_config.linear_backend = self.linear_backend
         if self.sparse_indexer_topk_backend != "auto":
