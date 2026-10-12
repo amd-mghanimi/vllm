@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 mono MoE on ROCm CDNA4 (``VLLM_ROCM_MONO_DECODE=1``).
+"""Kimi-K3 mono MoE on ROCm CDNA4 (``VLLM_ROCM_MONO_MOE=1``).
 
 A small decode step's routed MoE -- the biased sigmoid top-k, the expert sort,
 the a4w4 routed experts -- and its shared expert run as one persistent FlyDSL
@@ -42,7 +42,7 @@ class MonoLatentMoE:
 
     @cached_property
     def layer_ok(self) -> bool:
-        """Whether this layer matches the launch (VLLM_ROCM_MONO_DECODE=1,
+        """Whether this layer matches the launch (VLLM_ROCM_MONO_MOE=1,
         gfx950).
 
         The launch is biased sigmoid top-k, renormalised and unscaled, then the
@@ -50,7 +50,7 @@ class MonoLatentMoE:
         or padding, and vLLM's bf16 KimiMLP shared expert. Read on the first
         forward, after weights are processed.
         """
-        if not (envs.VLLM_ROCM_MONO_DECODE and current_platform.is_rocm()):
+        if not (envs.VLLM_ROCM_MONO_MOE and current_platform.is_rocm()):
             return False
         from vllm.platforms.rocm import on_gfx950
 

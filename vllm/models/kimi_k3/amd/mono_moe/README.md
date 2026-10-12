@@ -16,7 +16,7 @@ routing.
 
 ## Scope
 
-- Opt-in: `VLLM_ROCM_MONO_DECODE=1`, gfx950, AITER's fused MoE with the a4w4
+- Opt-in: `VLLM_ROCM_MONO_MOE=1`, gfx950, AITER's fused MoE with the a4w4
   SiTUv2 activation (`VLLM_ROCM_USE_AITER_MOE_SITUV2=1`). Otherwise, or when
   FlyDSL / AITER's FlyDSL kernels are missing, the multi-kernel path runs.
 - Layers: every routed MoE layer the ROCm latent MoE runner owns whose router

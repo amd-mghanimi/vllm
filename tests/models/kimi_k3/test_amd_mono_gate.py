@@ -62,12 +62,12 @@ def _call(s, m, x_dtype=torch.bfloat16, logits_dtype=torch.float32, shared=True)
 
 
 def test_off_without_switch(monkeypatch):
-    monkeypatch.delenv("VLLM_ROCM_MONO_DECODE", raising=False)
+    monkeypatch.delenv("VLLM_ROCM_MONO_MOE", raising=False)
     assert mono_moe_decode.MonoLatentMoE(types.SimpleNamespace()).layer_ok is False
 
 
 def test_off_on_other_platforms(monkeypatch):
-    monkeypatch.setenv("VLLM_ROCM_MONO_DECODE", "1")
+    monkeypatch.setenv("VLLM_ROCM_MONO_MOE", "1")
     monkeypatch.setattr(mono_moe_decode.current_platform, "is_rocm", lambda: False)
     assert mono_moe_decode.MonoLatentMoE(types.SimpleNamespace()).layer_ok is False
 

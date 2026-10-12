@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_MONO_DECODE: bool = False
+    VLLM_ROCM_MONO_MOE: bool = False
     VLLM_MONO_FAULT_INJECT: str = ""
     VLLM_MONO_UNSAFE_WARN: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
@@ -1394,11 +1395,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         in ("true", "1")
     ),
     # Run the eligible layers of decode steps on the model's mono decode
-    # kernels: persistent launches that fuse a layer's kernels (DeepSeek-V4.1
-    # with the TP all-reduces in-kernel, Kimi-K3's MoE; CDNA4).
-    # By default is disabled.
+    # kernels: persistent launches a layer, the TP all-reduces in-kernel
+    # (DeepSeek-V4.1 and Kimi-K3 on CDNA4). By default is disabled.
     "VLLM_ROCM_MONO_DECODE": lambda: (
         os.getenv("VLLM_ROCM_MONO_DECODE", "False").lower() in ("true", "1")
+    ),
+    # Run small decode batches' MoE layers (routed and shared experts) as one
+    # persistent launch: Kimi-K3 on CDNA4, any decode step the mono decode
+    # kernels do not take. By default is disabled.
+    "VLLM_ROCM_MONO_MOE": lambda: (
+        os.getenv("VLLM_ROCM_MONO_MOE", "False").lower() in ("true", "1")
     ),
     # Tests only: "rank:epoch:us" builds the mono decode kernels with a fault
     # hook that stalls that TP rank for us microseconds in every step from that
