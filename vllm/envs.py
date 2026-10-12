@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_MONO_DECODE: bool = False
+    VLLM_MONO_FAULT_INJECT: str = ""
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1397,6 +1398,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_MONO_DECODE": lambda: (
         os.getenv("VLLM_ROCM_MONO_DECODE", "False").lower() in ("true", "1")
     ),
+    # Tests only: "rank:epoch:us" builds the mono decode kernels with a fault
+    # hook that stalls that TP rank for us microseconds in every step from that
+    # epoch on, so a test can check the engine fails the step and stops.
+    "VLLM_MONO_FAULT_INJECT": lambda: os.getenv("VLLM_MONO_FAULT_INJECT", ""),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
