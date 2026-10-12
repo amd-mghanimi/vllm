@@ -12,7 +12,7 @@ import types
 import pytest
 import torch
 
-from vllm.models.kimi_k3.amd import mono_decode
+from vllm.models.kimi_k3.amd import mono_moe_decode
 
 RUNNER = "vllm.models.kimi_k3.amd.mono_moe.runner"
 HIDDEN, SH_HIDDEN, NE = 3584, 7168, 896
@@ -29,7 +29,7 @@ class _Experts:
 
 def _stub(layer_ok=True):
     r = types.SimpleNamespace(router=_Router(), routed_experts=_Experts())
-    s = mono_decode.MonoLatentMoE(r)
+    s = mono_moe_decode.MonoLatentMoE(r)
     s.__dict__["layer_ok"] = layer_ok
     s.__dict__["shared_mlp_weights"] = (
         torch.empty(1536, SH_HIDDEN, dtype=torch.bfloat16),
@@ -63,13 +63,13 @@ def _call(s, m, x_dtype=torch.bfloat16, logits_dtype=torch.float32, shared=True)
 
 def test_off_without_switch(monkeypatch):
     monkeypatch.delenv("VLLM_ROCM_MONO_DECODE", raising=False)
-    assert mono_decode.MonoLatentMoE(types.SimpleNamespace()).layer_ok is False
+    assert mono_moe_decode.MonoLatentMoE(types.SimpleNamespace()).layer_ok is False
 
 
 def test_off_on_other_platforms(monkeypatch):
     monkeypatch.setenv("VLLM_ROCM_MONO_DECODE", "1")
-    monkeypatch.setattr(mono_decode.current_platform, "is_rocm", lambda: False)
-    assert mono_decode.MonoLatentMoE(types.SimpleNamespace()).layer_ok is False
+    monkeypatch.setattr(mono_moe_decode.current_platform, "is_rocm", lambda: False)
+    assert mono_moe_decode.MonoLatentMoE(types.SimpleNamespace()).layer_ok is False
 
 
 def test_small_decode_batches(fake_runner):

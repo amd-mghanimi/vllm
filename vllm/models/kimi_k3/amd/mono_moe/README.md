@@ -24,7 +24,7 @@ routing.
   EPLB / DP / sequence parallel, no expert bias, no padding and no swiglu
   limit, and whose shared expert is KimiMLP as vLLM builds it (unquantized
   bf16, SiTU, unreduced down projection)
-  (`mono_decode.MonoLatentMoE.layer_ok`).
+  (`mono_moe_decode.MonoLatentMoE.layer_ok`).
 - Steps: M <= 32 tokens (`runner.M_MAX`, two m-blocks of the shared expert;
   each call compiles for its token count rounded up to 16). Larger steps take
   the multi-kernel path.
@@ -37,15 +37,15 @@ routing.
 
 ## Launch
 
-    ../mono_decode.py  vLLM side: which layers and steps take the launch
-    runner.py         launcher cache, workspace, mono_moe() (the host entry)
-    layer.py          the launch: ticket loop over the stages below
-    stages/route.py   top-k of one token, the expert sort
-    stages/shared.py  shared expert gate/up K splits, down tiles
-    stages/gemm1.py   AITER's a4w4 stage-1 tile, outputs stored write-through
-    common/plan.py    geometry, control-word and workspace layout
-    common/sync.py    tickets, counters, flags
-    common/ops.py     device primitives, trace marks
+    ../mono_moe_decode.py  vLLM side: which layers and steps take the launch
+    runner.py              launcher cache, workspace, mono_moe() (the host entry)
+    layer.py               the launch: ticket loop over the stages below
+    stages/route.py        top-k of one token, the expert sort
+    stages/shared.py       shared expert gate/up K splits, down tiles
+    stages/gemm1.py        AITER's a4w4 stage-1 tile, outputs stored write-through
+    common/plan.py         geometry, control-word and workspace layout
+    common/sync.py         tickets, counters, flags
+    common/ops.py          device primitives, trace marks
 
 gemm2 is AITER's a4w4 stage-2 tile, emitted into this launch through its
 dispatcher's composition hook (`compile_gemm2_a4w4_port(_composition=...)`).
