@@ -366,3 +366,33 @@ def test_async_copy_to_np_does_not_alias_reused_buffer():
     buffer.fill_(1)
 
     assert snapshot.tolist() == [0, 0, 0, 0]
+
+
+@pytest.mark.parametrize("words", [[0, 0], [0, 1]])
+def test_async_output_fails_a_step_the_model_reports_unhealthy(monkeypatch, words):
+    """A step whose model health words are set must not return its tokens."""
+    from contextlib import nullcontext
+
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.worker.gpu import async_utils
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: Mock())
+    monkeypatch.setattr(async_utils, "stream", lambda *args: nullcontext())
+    output = async_utils.AsyncOutput(
+        ModelRunnerOutput(["request"], {"request": 0}),
+        SamplerOutput(
+            torch.tensor([[7]]), None, None, None, num_rejected=torch.tensor([0])
+        ),
+        torch.tensor([1]),
+        Mock(),
+        Mock(),
+        check_ep_fault=False,
+        pending_aux_output=None,
+        step_health=torch.tensor(words, dtype=torch.int32),
+    )
+    if any(words):
+        with pytest.raises(RuntimeError, match="failed step"):
+            output.get_output()
+    else:
+        assert output.get_output().sampled_token_ids == [[7]]
