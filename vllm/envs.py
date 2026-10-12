@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_MONO_DECODE: bool = False
     VLLM_MONO_FAULT_INJECT: str = ""
+    VLLM_MONO_UNSAFE_WARN: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1402,6 +1403,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # hook that stalls that TP rank for us microseconds in every step from that
     # epoch on, so a test can check the engine fails the step and stops.
     "VLLM_MONO_FAULT_INJECT": lambda: os.getenv("VLLM_MONO_FAULT_INJECT", ""),
+    # Tests and benchmarks only: a MonoKernel step that failed is logged and
+    # its tokens are returned instead of stopping the engine.
+    "VLLM_MONO_UNSAFE_WARN": lambda: (
+        os.getenv("VLLM_MONO_UNSAFE_WARN", "0").lower() in ("1", "true")
+    ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
