@@ -31,7 +31,8 @@ class GateLinear(ReplicatedLinear):
     4. bf16x3 CuteDSL kernel (SM100, bf16 in, fp32 weight)
     5. ROCm bf16x3 router GEMM (gfx950, bf16 in, fp32 weight, fp32 out,
        M>=2048)
-    6. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    6. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype); on
+       gfx950, model-specific shapes run a low-M GEMV up to 8 tokens instead
     7. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -74,8 +75,10 @@ class GateLinear(ReplicatedLinear):
 
             is_gfx950 = on_gfx950()
         is_rocm_fp32_shape = False
+        is_rocm_bf16_weight_shape = False
         if is_gfx950:
             from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (  # noqa: E501
+                ROCM_BF16_WEIGHT_ROUTER_GEMM_SUPPORTED_SHAPES,
                 ROCM_FP32_ROUTER_GEMM_SUPPORTED_SHAPES,
             )
 
@@ -83,6 +86,10 @@ class GateLinear(ReplicatedLinear):
                 input_size,
                 output_size,
             ) in ROCM_FP32_ROUTER_GEMM_SUPPORTED_SHAPES
+            is_rocm_bf16_weight_shape = (
+                input_size,
+                output_size,
+            ) in ROCM_BF16_WEIGHT_ROUTER_GEMM_SUPPORTED_SHAPES
         batch_invariant = envs.VLLM_BATCH_INVARIANT
         can_use_specialized_kernels = (
             current_platform.is_cuda()
@@ -158,6 +165,9 @@ class GateLinear(ReplicatedLinear):
             and self.weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
+        # Inside tier 6: gfx950 shapes whose low-M batches beat hipBLASLt with
+        # the Triton router GEMV (bf16 weights, fp32 accumulate and output).
+        self._rocm_bf16_weight_router_gemm = is_rocm_bf16_weight_shape
 
         # ROCm bf16x3 router GEMM eligibility. out_dtype may still be None here
         # and is folded in by set_out_dtype; the split itself is only built
@@ -349,7 +359,12 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 6: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            if self._rocm_bf16_weight_router_gemm:
+                output = torch.ops.vllm.rocm_bf16_weight_router_gemm_dispatch(
+                    x, self.weight
+                )
+            else:
+                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return self._return(output)
 
         # Tier 7: F.linear (ReplicatedLinear)
@@ -500,4 +515,39 @@ direct_register_custom_op(
     op_name="fp32_router_gemm_dispatch",
     op_func=fp32_router_gemm_dispatch_impl,
     fake_impl=fp32_router_gemm_dispatch_fake,
+)
+
+
+def rocm_bf16_weight_router_gemm_dispatch_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run the gfx950 low-M router GEMV on bf16 router weights, or the
+    hipBLASLt bf16 x bf16 -> fp32 GEMM above its token limit.
+
+    A custom op for the same reason as ``fp32_router_gemm_dispatch``: the
+    num_tokens branch must not be frozen by torch.compile.
+    """
+    from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (  # noqa: E501
+        can_use_rocm_fp32_router_gemm,
+        rocm_fp32_router_gemm,
+    )
+
+    x_contiguous = x.contiguous()
+    if can_use_rocm_fp32_router_gemm(x_contiguous, weight):
+        return rocm_fp32_router_gemm(x_contiguous, weight)
+    return torch.mm(x, weight.T, out_dtype=torch.float32)
+
+
+def rocm_bf16_weight_router_gemm_dispatch_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="rocm_bf16_weight_router_gemm_dispatch",
+    op_func=rocm_bf16_weight_router_gemm_dispatch_impl,
+    fake_impl=rocm_bf16_weight_router_gemm_dispatch_fake,
 )

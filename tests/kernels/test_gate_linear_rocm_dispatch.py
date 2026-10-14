@@ -172,6 +172,39 @@ def test_rocm_fp32_router_gemm_rejects_unsupported_configs(
     assert not gate.allow_fp32_router_gemm
 
 
+@pytest.mark.parametrize(
+    ("input_size", "output_size", "on_gfx950", "expected"),
+    [
+        pytest.param(7168, 896, True, True, id="gfx950"),
+        pytest.param(7168, 896, False, False, id="gfx942"),
+        pytest.param(6144, 128, True, False, id="shape"),
+    ],
+)
+def test_rocm_bf16_weight_router_gemm_eligibility(
+    monkeypatch, input_size: int, output_size: int, on_gfx950: bool, expected: bool
+) -> None:
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=True,
+        input_size=input_size,
+        output_size=output_size,
+        on_gfx950=on_gfx950,
+    )
+    # The low-M GEMV is a branch of the torch.mm tier, so that tier stays on.
+    assert gate.allow_cublas_router_gemm
+    assert gate._rocm_bf16_weight_router_gemm is expected
+    assert not gate.allow_fp32_router_gemm
+
+
+def test_rocm_bf16_weight_router_gemm_dispatch_is_a_custom_op():
+    assert hasattr(torch.ops.vllm, "rocm_bf16_weight_router_gemm_dispatch")
+    x = torch.zeros(4, 7168, dtype=torch.bfloat16, device="meta")
+    w = torch.zeros(896, 7168, dtype=torch.bfloat16, device="meta")
+    out = torch.ops.vllm.rocm_bf16_weight_router_gemm_dispatch(x, w)
+    assert out.shape == (4, 896)
+    assert out.dtype == torch.float32
+
+
 # ---------------------------------------------------------------------------
 # ROCm BF16x3 tier (fp32 router weights)
 # ---------------------------------------------------------------------------
