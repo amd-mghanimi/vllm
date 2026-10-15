@@ -205,6 +205,53 @@ def test_rocm_bf16_weight_router_gemm_dispatch_is_a_custom_op():
     assert out.dtype == torch.float32
 
 
+@pytest.mark.parametrize(
+    ("gemv_ok", "tgemm_enabled", "expected"),
+    [
+        pytest.param(True, True, "gemv", id="gemv"),
+        pytest.param(False, True, "tgemm", id="aiter"),
+        pytest.param(False, False, "mm", id="torch-mm"),
+    ],
+)
+def test_rocm_bf16_weight_router_gemm_dispatch_routing(
+    monkeypatch, gemv_ok: bool, tgemm_enabled: bool, expected: str
+) -> None:
+    import sys
+    import types
+
+    import vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm as rfr
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    calls = []
+    x = torch.randn(16, 64, dtype=torch.bfloat16)
+    w = torch.randn(32, 64, dtype=torch.bfloat16)
+
+    def gemv(x_, w_):
+        calls.append("gemv")
+        return torch.zeros(x_.shape[0], w_.shape[0])
+
+    def tgemm_mm(x_, w_, bias=None, otype=None):
+        calls.append("tgemm")
+        assert otype == torch.float32
+        return torch.zeros(x_.shape[0], w_.shape[0], dtype=otype)
+
+    monkeypatch.setattr(rfr, "can_use_rocm_fp32_router_gemm", lambda *a: gemv_ok)
+    monkeypatch.setattr(rfr, "rocm_fp32_router_gemm", gemv)
+    monkeypatch.setattr(rocm_aiter_ops, "is_tgemm_enabled", lambda: tgemm_enabled)
+    fake_tuned_gemm = types.ModuleType("aiter.tuned_gemm")
+    fake_tuned_gemm.tgemm = types.SimpleNamespace(mm=tgemm_mm)
+    monkeypatch.setitem(sys.modules, "aiter", types.ModuleType("aiter"))
+    monkeypatch.setitem(sys.modules, "aiter.tuned_gemm", fake_tuned_gemm)
+
+    out = gate_linear_mod.rocm_bf16_weight_router_gemm_dispatch_impl(x, w)
+
+    assert out.shape == (16, 32)
+    assert out.dtype == torch.float32
+    assert calls == ([] if expected == "mm" else [expected])
+    if expected == "mm":
+        torch.testing.assert_close(out, torch.mm(x, w.T, out_dtype=torch.float32))
+
+
 # ---------------------------------------------------------------------------
 # ROCm BF16x3 tier (fp32 router weights)
 # ---------------------------------------------------------------------------

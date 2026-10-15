@@ -32,7 +32,8 @@ class GateLinear(ReplicatedLinear):
     5. ROCm bf16x3 router GEMM (gfx950, bf16 in, fp32 weight, fp32 out,
        M>=2048)
     6. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype); on
-       gfx950, model-specific shapes run a low-M GEMV up to 8 tokens instead
+       gfx950, model-specific shapes run a low-M GEMV up to 8 tokens and
+       AITER's tuned GEMM above that instead
     7. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -522,12 +523,15 @@ def rocm_bf16_weight_router_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the gfx950 low-M router GEMV on bf16 router weights, or the
-    hipBLASLt bf16 x bf16 -> fp32 GEMM above its token limit.
+    """Run the gfx950 low-M router GEMV on bf16 router weights; above its token
+    limit, AITER's tuned bf16 GEMM with fp32 output when enabled (it falls back
+    to the same ``torch.mm`` epilogue for shapes it has no tuned row for), else
+    the hipBLASLt bf16 x bf16 -> fp32 GEMM.
 
     A custom op for the same reason as ``fp32_router_gemm_dispatch``: the
     num_tokens branch must not be frozen by torch.compile.
     """
+    from vllm._aiter_ops import rocm_aiter_ops
     from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (  # noqa: E501
         can_use_rocm_fp32_router_gemm,
         rocm_fp32_router_gemm,
@@ -536,6 +540,10 @@ def rocm_bf16_weight_router_gemm_dispatch_impl(
     x_contiguous = x.contiguous()
     if can_use_rocm_fp32_router_gemm(x_contiguous, weight):
         return rocm_fp32_router_gemm(x_contiguous, weight)
+    if rocm_aiter_ops.is_tgemm_enabled():
+        from aiter.tuned_gemm import tgemm
+
+        return tgemm.mm(x_contiguous, weight, otype=torch.float32)
     return torch.mm(x, weight.T, out_dtype=torch.float32)
 
 
