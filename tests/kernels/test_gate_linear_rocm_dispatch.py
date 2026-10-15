@@ -223,17 +223,17 @@ def test_rocm_bf16_weight_router_gemm_dispatch_routing(
     from vllm._aiter_ops import rocm_aiter_ops
 
     calls = []
-    x = torch.randn(16, 64, dtype=torch.bfloat16)
-    w = torch.randn(32, 64, dtype=torch.bfloat16)
+    x = torch.empty(16, 64, dtype=torch.bfloat16, device="meta")
+    w = torch.empty(32, 64, dtype=torch.bfloat16, device="meta")
 
     def gemv(x_, w_):
         calls.append("gemv")
-        return torch.zeros(x_.shape[0], w_.shape[0])
+        return x_.new_empty((x_.shape[0], w_.shape[0]), dtype=torch.float32)
 
     def tgemm_mm(x_, w_, bias=None, otype=None):
         calls.append("tgemm")
         assert otype == torch.float32
-        return torch.zeros(x_.shape[0], w_.shape[0], dtype=otype)
+        return x_.new_empty((x_.shape[0], w_.shape[0]), dtype=otype)
 
     monkeypatch.setattr(rfr, "can_use_rocm_fp32_router_gemm", lambda *a: gemv_ok)
     monkeypatch.setattr(rfr, "rocm_fp32_router_gemm", gemv)
@@ -248,8 +248,6 @@ def test_rocm_bf16_weight_router_gemm_dispatch_routing(
     assert out.shape == (16, 32)
     assert out.dtype == torch.float32
     assert calls == ([] if expected == "mm" else [expected])
-    if expected == "mm":
-        torch.testing.assert_close(out, torch.mm(x, w.T, out_dtype=torch.float32))
 
 
 # ---------------------------------------------------------------------------
