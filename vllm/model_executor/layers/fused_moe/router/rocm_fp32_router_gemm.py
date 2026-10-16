@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Low-token FP32 router GEMM for gfx950."""
+"""Low-token router GEMM with FP32 output for gfx950 (FP32 or BF16 router weights)."""
 
 import torch
 
@@ -16,6 +16,13 @@ ROCM_FP32_ROUTER_GEMM_SUPPORTED_SHAPES = frozenset(
         (4096, 192),
         (6144, 128),
         (6144, 256),
+    }
+)
+# BF16 router weights, where it beats the hipBLASLt bf16 x bf16 -> fp32 GEMM.
+_BF16_WEIGHT_MAX_TOKENS = 8
+ROCM_BF16_WEIGHT_ROUTER_GEMM_SUPPORTED_SHAPES = frozenset(
+    {
+        (7168, 896),
     }
 )
 
@@ -45,7 +52,9 @@ def _rocm_fp32_router_gemm_kernel(
             mask=offsets_m[:, None] < M,
             other=0.0,
         ).to(tl.float32)
-        router_weight = tl.load(router_weight_ptr + pid_n * K + offsets_k_block)
+        router_weight = tl.load(router_weight_ptr + pid_n * K + offsets_k_block).to(
+            tl.float32
+        )
         partials += hidden_states * router_weight[None, :]
 
     accumulator = tl.sum(partials, axis=1)
@@ -66,6 +75,8 @@ def _launch_config(
 
     if num_tokens <= 4:
         return 1, 1024, 8
+    if (hidden_size, num_experts) == (7168, 896):
+        return 4, 1024, 4
     if num_tokens <= 16:
         block_m = 8 if (hidden_size, num_experts) == (6144, 256) else 4
         return block_m, 1024, 8
@@ -96,8 +107,8 @@ def _validate_inputs(
         raise ValueError("hidden_states and router_weight must be 2D tensors")
     if hidden_states.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("hidden_states must have dtype bfloat16 or float32")
-    if router_weight.dtype != torch.float32:
-        raise ValueError("router_weight must have dtype float32")
+    if router_weight.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("router_weight must have dtype float32 or bfloat16")
     if hidden_states.device.type != "cuda" or router_weight.device.type != "cuda":
         raise ValueError("hidden_states and router_weight must be GPU tensors")
     if hidden_states.device != router_weight.device:
@@ -105,17 +116,22 @@ def _validate_inputs(
     if not hidden_states.is_contiguous() or not router_weight.is_contiguous():
         raise ValueError("hidden_states and router_weight must be contiguous")
     shape = (hidden_states.shape[1], router_weight.shape[0])
-    if (
-        shape not in ROCM_FP32_ROUTER_GEMM_SUPPORTED_SHAPES
-        or router_weight.shape[1] != shape[0]
-    ):
-        raise ValueError(
-            "supported (hidden_size, num_experts) shape pairs are "
-            "(3072, 256), (4096, 8), (4096, 192), (6144, 128), "
-            "and (6144, 256)"
+    if router_weight.dtype == torch.bfloat16:
+        if hidden_states.dtype != torch.bfloat16:
+            raise ValueError("bfloat16 router_weight needs bfloat16 hidden_states")
+        supported, max_tokens = (
+            ROCM_BF16_WEIGHT_ROUTER_GEMM_SUPPORTED_SHAPES,
+            _BF16_WEIGHT_MAX_TOKENS,
         )
-    if not 0 <= hidden_states.shape[0] <= _MAX_TOKENS:
-        raise ValueError(f"num_tokens must be in [0, {_MAX_TOKENS}]")
+    else:
+        supported, max_tokens = ROCM_FP32_ROUTER_GEMM_SUPPORTED_SHAPES, _MAX_TOKENS
+    if shape not in supported or router_weight.shape[1] != shape[0]:
+        raise ValueError(
+            f"supported (hidden_size, num_experts) shape pairs for "
+            f"{router_weight.dtype} router weights are {sorted(supported)}"
+        )
+    if not 0 <= hidden_states.shape[0] <= max_tokens:
+        raise ValueError(f"num_tokens must be in [0, {max_tokens}]")
 
 
 def rocm_fp32_router_gemm(
