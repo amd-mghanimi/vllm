@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
 from vllm.model_executor.layers.linear import (
+    LinearMethodBase,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -152,6 +153,53 @@ class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
+
+
+class MuseSparkLargeMNativeLinearMethod(LinearMethodBase):
+    """Keep the normal linear method through 8k tokens, then use F.linear.
+
+    On MI350X/MI355X the AITER unquantized-GEMM dispatch switches kernels above
+    8192 tokens for Muse Spark's BF16 o_proj. The two kernels differ in their
+    BF16 rounding. PyTorch native uses one result at both sizes, while the
+    fallback preserves the established 8k/decode path.
+    """
+
+    def __init__(self, fallback: LinearMethodBase, min_tokens: int = 8193) -> None:
+        self.fallback = fallback
+        self.min_tokens = min_tokens
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        self.fallback.create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.fallback.process_weights_after_loading(layer)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.shape[0] >= self.min_tokens:
+            return F.linear(x, layer.weight, bias)
+        return self.fallback.apply(layer, x, bias)
 
 
 class MuseSpark1xMoE(nn.Module):
@@ -492,6 +540,10 @@ class MuseSpark1xAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if current_platform.is_rocm():
+            self.o_proj.quant_method = MuseSparkLargeMNativeLinearMethod(
+                self.o_proj.quant_method
+            )
 
         # GPT-J style: rotates interleaved adjacent channel pairs.
         self.rotary_emb = (
