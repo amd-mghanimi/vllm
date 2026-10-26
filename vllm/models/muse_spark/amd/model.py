@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
 from vllm.model_executor.layers.linear import (
+    LinearMethodBase,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -152,6 +153,43 @@ class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
+
+
+class MuseSparkLargeMNativeLinearMethod(LinearMethodBase):
+    """Native GEMM above min_tokens. ``fallback`` handles every smaller batch."""
+
+    def __init__(self, fallback: LinearMethodBase, min_tokens: int = 8192) -> None:
+        self.fallback = fallback
+        self.min_tokens = min_tokens
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs) -> None:
+        self.fallback.create_weights(layer, *args, **kwargs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.fallback.process_weights_after_loading(layer)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.shape[0] > self.min_tokens:
+            return F.linear(x, layer.weight, bias)
+        return self.fallback.apply(layer, x, bias)
+
+
+class MuseSparkRowParallelLinear(RowParallelLinear):
+    """gfx950 o_proj. M above 8192 uses one native GEMM."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        from vllm.platforms.rocm import on_gfx950
+
+        if on_gfx950():
+            self.quant_method = MuseSparkLargeMNativeLinearMethod(
+                fallback=self.quant_method,
+            )
 
 
 class MuseSpark1xMoE(nn.Module):
@@ -485,7 +523,7 @@ class MuseSpark1xAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.qkv_proj",
             )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = MuseSparkRowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
             output_size=self.hidden_size,
             bias=False,
