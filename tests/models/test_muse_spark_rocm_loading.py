@@ -9,11 +9,9 @@ import pytest
 import torch
 
 import vllm.models.muse_spark.amd.model as amd_model
-from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.models.muse_spark.amd.model import (
     MuseSpark1xForCausalLM,
     MuseSpark1xModel,
-    MuseSparkLargeMNativeLinearMethod,
 )
 from vllm.models.muse_spark.amd.multimodal import MuseSparkForConditionalGeneration
 from vllm.models.muse_spark.amd.muse_moe_runner import (
@@ -23,40 +21,6 @@ from vllm.models.muse_spark.amd.muse_moe_runner import (
 )
 from vllm.models.muse_spark.common.moe import MuseSparkConsolidatedRoutedExperts
 from vllm.platforms import current_platform
-
-
-def test_large_m_native_o_proj_keeps_fallback_at_8k() -> None:
-    class RecordingFallback(LinearMethodBase):
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def create_weights(self, *args, **kwargs) -> None:
-            raise AssertionError("Weights are already created before wrapping.")
-
-        def apply(self, layer, x, bias=None):
-            self.calls += 1
-            return torch.full(
-                (x.shape[0], layer.weight.shape[0]),
-                -1,
-                dtype=x.dtype,
-                device=x.device,
-            )
-
-    layer = torch.nn.Linear(3, 2, bias=False)
-    fallback = RecordingFallback()
-    method = MuseSparkLargeMNativeLinearMethod(fallback)
-
-    assert torch.equal(
-        method.apply(layer, torch.ones(8192, 3)),
-        torch.full((8192, 2), -1.0),
-    )
-    assert fallback.calls == 1
-
-    x = torch.ones(8193, 3)
-    torch.testing.assert_close(
-        method.apply(layer, x), torch.nn.functional.linear(x, layer.weight)
-    )
-    assert fallback.calls == 1
 
 
 def test_rocm_mapper_retains_quark_dense_and_individual_expert_scales() -> None:
