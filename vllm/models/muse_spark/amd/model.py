@@ -158,10 +158,10 @@ class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
 class MuseSparkLargeMNativeLinearMethod(LinearMethodBase):
     """Keep the normal linear method through 8k tokens, then use F.linear.
 
-    On MI350X/MI355X the AITER unquantized-GEMM dispatch switches kernels above
-    8192 tokens for Muse Spark's BF16 o_proj. The two kernels differ in their
-    BF16 rounding. PyTorch native uses one result at both sizes, while the
-    fallback preserves the established 8k/decode path.
+    On gfx950 the AITER unquantized-GEMM dispatch switches kernels above 8192
+    tokens for Muse Spark's BF16 o_proj. The two kernels differ in their BF16
+    rounding. PyTorch native uses one result at both sizes, while the fallback
+    preserves the established 8k/decode path.
     """
 
     def __init__(self, fallback: LinearMethodBase, min_tokens: int = 8193) -> None:
@@ -540,7 +540,10 @@ class MuseSpark1xAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        if current_platform.is_rocm():
+        # This module is the AMD implementation. The kernel switch is gfx950-only.
+        from vllm.platforms.rocm import on_gfx950
+
+        if on_gfx950():
             self.o_proj.quant_method = MuseSparkLargeMNativeLinearMethod(
                 self.o_proj.quant_method
             )
