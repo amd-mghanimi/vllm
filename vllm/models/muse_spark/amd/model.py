@@ -156,7 +156,7 @@ class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
 
 
 class MuseSparkLargeMNativeLinearMethod(LinearMethodBase):
-    """Use the installed GEMM through min_tokens, then F.linear."""
+    """Native GEMM above min_tokens. ``fallback`` handles every smaller batch."""
 
     def __init__(self, fallback: LinearMethodBase, min_tokens: int = 8192) -> None:
         self.fallback = fallback
@@ -187,7 +187,9 @@ class MuseSparkRowParallelLinear(RowParallelLinear):
         from vllm.platforms.rocm import on_gfx950
 
         if on_gfx950():
-            self.quant_method = MuseSparkLargeMNativeLinearMethod(self.quant_method)
+            self.quant_method = MuseSparkLargeMNativeLinearMethod(
+                fallback=self.quant_method,
+            )
 
 
 class MuseSpark1xMoE(nn.Module):
