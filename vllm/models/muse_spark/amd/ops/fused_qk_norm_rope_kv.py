@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
 # AITER's fp8 cache is e4m3 only.
 _SHUFFLED_KV_CACHE_DTYPES = frozenset(
@@ -237,6 +238,26 @@ def shuffled_insert_buffers(
     return rows, q_out, pad_slot_mapping(slot_mapping, rows.shape[0])
 
 
+def _emit_fp8_query(metadata: object, attn_layer: torch.nn.Module) -> bool:
+    """fp8 Q for a decode-only step on a full-attention fp8 shuffled layer.
+
+    Sliding-window decode stays on ``pa_decode_gluon`` with a bf16 query.
+    A step that also prefills or extends keeps a bf16 query, because those
+    paths run flash-attn on bf16 K/V. The attention backend quantizes the
+    decode slice itself in that case.
+    """
+    if metadata is None or not is_quantized_kv_cache(attn_layer.kv_cache_dtype):
+        return False
+    impl = getattr(attn_layer, "impl", None)
+    if impl is None or impl.sliding_window[0] != -1:
+        return False
+    return (
+        getattr(metadata, "num_prefills", 1) == 0
+        and getattr(metadata, "num_extends", 1) == 0
+        and getattr(metadata, "num_decodes", 0) > 0
+    )
+
+
 def shuffled_fused_qk_norm_rope_kv_insert(
     qkv: torch.Tensor,
     positions: torch.Tensor,
@@ -252,12 +273,19 @@ def shuffled_fused_qk_norm_rope_kv_insert(
     cos_sin_cache, kernel_positions, rotary_dim = kernel_rope_args(
         rotary_emb, positions, head_dim, qkv.dtype
     )
-    _, attn_layer, kv_cache, slot_mapping = get_attention_context(layer_name)
+    metadata, attn_layer, kv_cache, slot_mapping = get_attention_context(layer_name)
     if slot_mapping is None or kv_cache.numel() == 0:
         return None
     rows, q_out, slots = shuffled_insert_buffers(
         qkv, slot_mapping, num_heads, num_kv_heads, head_dim
     )
+    # Same per-tensor scale the attention kernel dequantizes with. Allocated
+    # per forward, like q_out, so a decode CUDA graph owns a stable address.
+    q_out_fp8 = None
+    if _emit_fp8_query(metadata, attn_layer):
+        q_out_fp8 = torch.empty(
+            q_out.shape, dtype=current_platform.fp8_dtype(), device=q_out.device
+        )
     fused_qk_norm_rope_kv_cache_update(
         qkv=rows,
         q_weight=norm_weight,
@@ -277,5 +305,7 @@ def shuffled_fused_qk_norm_rope_kv_insert(
         kv_cache_dtype=attn_layer.kv_cache_dtype,
         rotary_dim=rotary_dim,
         use_shuffle_layout=True,
+        q_out_fp8=q_out_fp8,
+        per_tensor_q_scale=attn_layer._q_scale if q_out_fp8 is not None else None,
     )
-    return q_out
+    return q_out if q_out_fp8 is None else q_out_fp8

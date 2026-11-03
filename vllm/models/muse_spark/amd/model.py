@@ -689,8 +689,17 @@ class MuseSpark1xAttention(nn.Module):
         q, k, v, og = self._qk_norm_rope_kv_insert(qkv, positions)
 
         # Withhold k/v so the attention layer does not rewrite the KV cache.
+        # An fp8 query (shuffled full-attention decode) must not change the
+        # residual dtype: the attention output stays in the activation dtype.
         if self.attn.kv_cache_update_bypass:
-            attn_output = self.attn(q, None, None)
+            attn_output = self.attn(
+                q,
+                None,
+                None,
+                output_dtype=None
+                if q.dtype == self.default_dtype
+                else self.default_dtype,
+            )
         else:
             attn_output = self.attn(q, k, v)
         return self.back(attn_output, og)

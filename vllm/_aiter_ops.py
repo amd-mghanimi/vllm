@@ -4040,6 +4040,8 @@ class rocm_aiter_ops:
         block_size: int,
         x: int,
         rotary_dim: int = 0,
+        q_out_fp8: torch.Tensor | None = None,
+        per_tensor_q_scale: torch.Tensor | None = None,
     ):
         from aiter.ops.fused_qk_norm_rope_cache_quant import (
             fused_qk_norm_rope_cache_pts_quant_shuffle,
@@ -4071,6 +4073,8 @@ class rocm_aiter_ops:
             block_size,
             x,
             rotary_dim,
+            q_out_fp8=q_out_fp8,
+            per_tensor_q_scale=per_tensor_q_scale,
         )
 
     @staticmethod

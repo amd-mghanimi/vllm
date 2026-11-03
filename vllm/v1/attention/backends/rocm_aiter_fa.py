@@ -1584,6 +1584,33 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     k_descale,
                     v_descale,
                 )
+            elif (
+                rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+                and is_quantized_kv_cache(self.kv_cache_dtype)
+            ):
+                # Single-token full attention. paged_attention_common does not
+                # take the gfx950 shuffled Gluon kernel; that kernel is
+                # unified_attention with an fp8 query. A pure decode step
+                # already receives one from the fused insert. A mixed step
+                # still has a bf16 query, so quantize the decode rows here.
+                k_descale, v_descale = self._get_kv_cache_descales(layer, num_decodes)
+                if query.dtype != current_platform.fp8_dtype():
+                    query = (query[:num_decode_tokens] / layer._q_scale).to(
+                        current_platform.fp8_dtype()
+                    )
+                self._shuffle_decode(
+                    layer,
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    attn_metadata,
+                    num_decodes,
+                    num_decode_tokens,
+                    decode_max_query_len,
+                    k_descale,
+                    v_descale,
+                )
             elif rocm_aiter_ops.is_shuffle_kv_cache_enabled():
                 _, num_heads, head_size = query.shape
                 num_blocks, block_size, num_kv_heads, _ = key_cache.shape
@@ -1793,7 +1820,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
             window_size=self.sliding_window,
             block_table=attn_metadata.block_table[:num_decodes],
             softcap=self.logits_soft_cap,
-            q_descale=None,
+            q_descale=(
+                layer._q_scale
+                if query.dtype == current_platform.fp8_dtype()
+                else None
+            ),
             k_descale=k_descale,
             v_descale=v_descale,
             sinks=self.sinks,

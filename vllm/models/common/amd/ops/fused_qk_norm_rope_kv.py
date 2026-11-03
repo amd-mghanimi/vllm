@@ -59,6 +59,8 @@ def fused_qk_norm_rope_kv_cache_update(
     return_kv: bool = False,
     k_out: torch.Tensor | None = None,
     v_out: torch.Tensor | None = None,
+    q_out_fp8: torch.Tensor | None = None,
+    per_tensor_q_scale: torch.Tensor | None = None,
 ) -> None:
     """Fuse Q/K norm, RoPE, and an AITER KV update."""
     key_cache, value_cache = split_shuffled_kv_cache(
@@ -89,4 +91,6 @@ def fused_qk_norm_rope_kv_cache_update(
         block_size=key_cache.shape[1],
         x=16 // key_cache.element_size(),
         rotary_dim=rotary_dim,
+        q_out_fp8=q_out_fp8,
+        per_tensor_q_scale=per_tensor_q_scale,
     )
