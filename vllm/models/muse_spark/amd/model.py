@@ -77,6 +77,10 @@ from .muse_moe_runner import (
 )
 from .ops.fused_norm_expand import fused_rmsnorm_expand
 from .ops.fused_qk_norm_rope_kv import rocm_fused_qk_norm_rope_kv_insert
+from .ops.fused_qk_norm_rope_shuffle_kv import (
+    shuffled_fused_qk_norm_rope_kv_insert,
+    supports_shuffled_fused_insert,
+)
 from .ops.router_bf16x3 import (
     router_bf16x3_gemm,
     split_fp32_to_bf16x3,
@@ -565,17 +569,27 @@ class MuseSpark1xAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Needs a model-written KV cache (ROCM_AITER_FA without shuffle layout).
-        self.fused_qk_norm_rope_kv_insert = (
+        fusable_qk_norm_rope = (
             self.use_qk_norm
             and self.qk_norm is not None
             and not self.qk_norm.has_weight
             and not self.use_attn_temperature_tuning
             and self.head_dim in (64, 128, 256)
             and self.default_dtype in (torch.bfloat16, torch.float16)
-            and supports_fused_kv_insert(self.attn)
         )
-        self.attn.kv_cache_update_bypass = self.fused_qk_norm_rope_kv_insert
+        # Needs a model-written KV cache (ROCM_AITER_FA without shuffle layout).
+        self.fused_qk_norm_rope_kv_insert = (
+            fusable_qk_norm_rope and supports_fused_kv_insert(self.attn)
+        )
+        # The shuffle layout takes the generic AITER insert instead.
+        self.fused_shuffled_kv_insert = (
+            fusable_qk_norm_rope
+            and not self.fused_qk_norm_rope_kv_insert
+            and supports_shuffled_fused_insert(self.attn)
+        )
+        self.attn.kv_cache_update_bypass = (
+            self.fused_qk_norm_rope_kv_insert or self.fused_shuffled_kv_insert
+        )
 
     @staticmethod
     def compute_attn_temperature_scale(
@@ -632,6 +646,19 @@ class MuseSpark1xAttention(nn.Module):
             og = None
         if self.fused_qk_norm_rope_kv_insert:
             return q, k, v, og
+        if self.fused_shuffled_kv_insert:
+            fused_q = shuffled_fused_qk_norm_rope_kv_insert(
+                qkv,
+                positions,
+                self.rotary_emb,
+                self.attn.layer_name,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rms_norm_eps,
+            )
+            if fused_q is not None:
+                return fused_q, k, v, og
 
         if self.qk_norm is not None:
             q = self.qk_norm(
@@ -662,7 +689,7 @@ class MuseSpark1xAttention(nn.Module):
         q, k, v, og = self._qk_norm_rope_kv_insert(qkv, positions)
 
         # Withhold k/v so the attention layer does not rewrite the KV cache.
-        if self.fused_qk_norm_rope_kv_insert:
+        if self.attn.kv_cache_update_bypass:
             attn_output = self.attn(q, None, None)
         else:
             attn_output = self.attn(q, k, v)
