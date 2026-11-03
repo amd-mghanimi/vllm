@@ -230,6 +230,34 @@ __device__ __forceinline__ void storeCache(cache_t* __restrict__ dst,
   }
 }
 
+// The shuffle K layout keeps each x-wide head-dimension group contiguous:
+// [B, H, D/x, N, x]. The V layout instead has one scalar from each D position
+// in that group: [B, H, N/x, D, x].
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
+          int kElems>
+__device__ __forceinline__ void storeCacheShuffleV(
+    cache_t* __restrict__ dst, uint4 const& packed, float const inv_scale,
+    int const dim_base, int const cache_tok, int const head_dim) {
+  using Converter = vllm::_typeConvert<scalar_t>;
+  using HipT = typename Converter::hip_type;
+  auto const* rounded = reinterpret_cast<HipT const*>(&packed);
+  constexpr int kX = kBytesPerLane / sizeof(cache_t);
+  int64_t const group_base =
+      (static_cast<int64_t>(cache_tok) / kX) * head_dim * kX +
+      static_cast<int64_t>(dim_base) * kX + cache_tok % kX;
+#pragma unroll
+  for (int i = 0; i < kElems; i++) {
+    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+      auto const* cache_values = reinterpret_cast<cache_t const*>(&packed);
+      dst[group_base + static_cast<int64_t>(i) * kX] = cache_values[i];
+    } else {
+      float const v = Converter::convert(rounded[i]) * inv_scale;
+      dst[group_base + static_cast<int64_t>(i) * kX] =
+          fp8::scaled_convert<cache_t, float, kv_dt>(v, 1.0f);
+    }
+  }
+}
+
 // Grid is 1D over (token, head-chunk) pairs. A chunk is HEADS_PER_GROUP
 // consecutive head slots of one token, served by kLanes contiguous lanes; the
 // whole chunk shares the token's position and its slice of the rope table, so
@@ -238,7 +266,7 @@ __device__ __forceinline__ void storeCache(cache_t* __restrict__ dst,
 // token. `rope_t` is the cos/sin cache dtype, independent of the qkv dtype.
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
           typename rope_t, int HEAD_DIM, int HEADS_PER_GROUP, bool kDoRope,
-          bool kInsertKV>
+          bool kInsertKV, bool kShuffleKV>
 __global__
 __launch_bounds__(256, 6) void fusedMuseSparkQKNormRopeKVInsertKernel(
     scalar_t* __restrict__ qkv,                // [N, qkv_stride] in/out
@@ -246,6 +274,8 @@ __launch_bounds__(256, 6) void fusedMuseSparkQKNormRopeKVInsertKernel(
     int64_t const* __restrict__ positions,     // [N] i64
     int64_t const* __restrict__ slot_mapping,  // [N] i64 or nullptr
     cache_t* __restrict__ kv_cache,            // [nb, nkv, bs, 2*HEAD_DIM]
+    cache_t* __restrict__ shuffled_k_cache,    // [nb, bs, nkv, head_dim]
+    cache_t* __restrict__ shuffled_v_cache,    // [nb, bs, nkv, head_dim]
     float const* __restrict__ k_scale,         // [1] or nullptr
     float const* __restrict__ v_scale,         // [1] or nullptr
     uint8_t* __restrict__ q_fp8_out,           // [N, nq * HEAD_DIM] or nullptr
@@ -253,7 +283,7 @@ __launch_bounds__(256, 6) void fusedMuseSparkQKNormRopeKVInsertKernel(
     float const eps, int const rotary_dim, int const num_tokens, int const nq,
     int const nkv, FastDiv const chunks_div, int64_t const qkv_stride,
     FastDiv const block_div, int64_t const kv_s_block, int64_t const kv_s_head,
-    int64_t const kv_s_token) {
+    int64_t const kv_s_token, int64_t const shuffle_s_block) {
 #if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
   // _typeConvert<BFloat16> is unavailable on pre-Ampere; this kernel only ever
   // runs with bf16/fp16 inputs. Discard the bf16 body there.
@@ -397,12 +427,30 @@ __launch_bounds__(256, 6) void fusedMuseSparkQKNormRopeKVInsertKernel(
       if constexpr (kInsertKV) {
         if (sm >= 0 && (isK || isV)) {  // sm < 0 marks a padded token
           int const head = isK ? (slot - nq) : (slot - nq - nkv);
-          int64_t const off = static_cast<int64_t>(cache_block) * kv_s_block +
-                              head * kv_s_head +
-                              static_cast<int64_t>(cache_tok) * kv_s_token +
-                              (isK ? 0 : HEAD_DIM) + dimBase;
-          storeCache<scalar_t, cache_t, kv_dt, kElems>(kv_cache + off, packed,
-                                                       isK ? k_inv : v_inv);
+          if constexpr (kShuffleKV) {
+            constexpr int kX = kBytesPerLane / sizeof(cache_t);
+            cache_t* const shuffle_base =
+                (isK ? shuffled_k_cache : shuffled_v_cache) +
+                static_cast<int64_t>(cache_block) * shuffle_s_block +
+                static_cast<int64_t>(head) * HEAD_DIM * block_div.div;
+            if (isK) {
+              int64_t const k_off =
+                  static_cast<int64_t>(dimBase / kX) * block_div.div * kX +
+                  static_cast<int64_t>(cache_tok) * kX + dimBase % kX;
+              storeCache<scalar_t, cache_t, kv_dt, kElems>(
+                  shuffle_base + k_off, packed, k_inv);
+            } else {
+              storeCacheShuffleV<scalar_t, cache_t, kv_dt, kElems>(
+                  shuffle_base, packed, v_inv, dimBase, cache_tok, HEAD_DIM);
+            }
+          } else {
+            int64_t const off =
+                static_cast<int64_t>(cache_block) * kv_s_block +
+                head * kv_s_head + static_cast<int64_t>(cache_tok) * kv_s_token +
+                (isK ? 0 : HEAD_DIM) + dimBase;
+            storeCache<scalar_t, cache_t, kv_dt, kElems>(
+                kv_cache + off, packed, isK ? k_inv : v_inv);
+          }
         }
       }
     }
@@ -422,10 +470,12 @@ void launchFusedMuseSparkTyped(
     scalar_t* qkv, rope_t const* cos_sin_cache, int64_t const* positions,
     int64_t const* slot_mapping, cache_t* kv_cache, float const* k_scale,
     float const* v_scale, uint8_t* q_fp8_out, float const* q_scale,
+    cache_t* shuffled_k_cache, cache_t* shuffled_v_cache,
     float const eps, int const rotary_dim, int const num_tokens, int const nq,
     int const nkv, int64_t const qkv_stride, int const block_size,
     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
-    bool const do_rope, bool const insert_kv, cudaStream_t stream) {
+    int64_t const shuffle_s_block, bool const do_rope, bool const insert_kv,
+    bool const shuffle_kv, cudaStream_t stream) {
   FastDiv const block_div = makeFastDiv(block_size);
   constexpr int kElems = kBytesPerLane / sizeof(scalar_t);
   constexpr int kLanes = HEAD_DIM / kElems;
@@ -455,38 +505,49 @@ void launchFusedMuseSparkTyped(
   config.attrs = attrs;
   config.numAttrs = (sm_version >= 90) ? 1 : 0;
 
-  #define LAUNCH_MUSE(DO_ROPE, INSERT)                                         \
+  #define LAUNCH_MUSE(DO_ROPE, INSERT, SHUFFLE)                                \
     cudaLaunchKernelEx(&config,                                                \
                        fusedMuseSparkQKNormRopeKVInsertKernel<                 \
                            scalar_t, cache_t, kv_dt, rope_t, HEAD_DIM,         \
-                           HEADS_PER_GROUP, DO_ROPE, INSERT>,                  \
+                           HEADS_PER_GROUP, DO_ROPE, INSERT, SHUFFLE>,         \
                        qkv, cos_sin_cache, positions, slot_mapping, kv_cache,  \
-                       k_scale, v_scale, q_fp8_out, q_scale, eps, rotary_dim,  \
-                       num_tokens, nq, nkv, chunks_div, qkv_stride, block_div, \
-                       kv_s_block, kv_s_head, kv_s_token)
+                       shuffled_k_cache, shuffled_v_cache, k_scale, v_scale,   \
+                       q_fp8_out, q_scale, eps, rotary_dim, num_tokens, nq,    \
+                       nkv, chunks_div, qkv_stride, block_div, kv_s_block,     \
+                       kv_s_head, kv_s_token, shuffle_s_block)
 #else
   // clang-format off
-  #define LAUNCH_MUSE(DO_ROPE, INSERT)                                        \
+  #define LAUNCH_MUSE(DO_ROPE, INSERT, SHUFFLE)                               \
     fusedMuseSparkQKNormRopeKVInsertKernel<                                   \
         scalar_t, cache_t, kv_dt, rope_t, HEAD_DIM, HEADS_PER_GROUP, DO_ROPE, \
-        INSERT><<<grid, kBlockSize, 0, stream>>>(                             \
-        qkv, cos_sin_cache, positions, slot_mapping, kv_cache, k_scale,       \
-        v_scale, q_fp8_out, q_scale, eps, rotary_dim, num_tokens, nq, nkv,    \
-        chunks_div, qkv_stride, block_div, kv_s_block, kv_s_head, kv_s_token)
+        INSERT, SHUFFLE><<<grid, kBlockSize, 0, stream>>>(                    \
+        qkv, cos_sin_cache, positions, slot_mapping, kv_cache,                \
+        shuffled_k_cache, shuffled_v_cache, k_scale, v_scale, q_fp8_out,      \
+        q_scale, eps, rotary_dim, num_tokens, nq, nkv, chunks_div,            \
+        qkv_stride, block_div, kv_s_block, kv_s_head, kv_s_token,             \
+        shuffle_s_block)
   // clang-format on
 #endif
 
-  if (do_rope) {
-    if (insert_kv) {
-      LAUNCH_MUSE(true, true);
+  if (shuffle_kv) {
+    if (do_rope) {
+      LAUNCH_MUSE(true, true, true);
     } else {
-      LAUNCH_MUSE(true, false);
+      LAUNCH_MUSE(false, true, true);
     }
   } else {
-    if (insert_kv) {
-      LAUNCH_MUSE(false, true);
+    if (do_rope) {
+      if (insert_kv) {
+        LAUNCH_MUSE(true, true, false);
+      } else {
+        LAUNCH_MUSE(true, false, false);
+      }
     } else {
-      LAUNCH_MUSE(false, false);
+      if (insert_kv) {
+        LAUNCH_MUSE(false, true, false);
+      } else {
+        LAUNCH_MUSE(false, false, false);
+      }
     }
   }
 #undef LAUNCH_MUSE
@@ -497,11 +558,13 @@ void launchFusedMuseSpark(
     scalar_t* qkv, void const* cos_sin_cache, bool const rope_is_fp32,
     int64_t const* positions, int64_t const* slot_mapping, cache_t* kv_cache,
     float const* k_scale, float const* v_scale, uint8_t* q_fp8_out,
-    float const* q_scale, float const eps, int const rotary_dim,
+    float const* q_scale, cache_t* shuffled_k_cache,
+    cache_t* shuffled_v_cache, float const eps, int const rotary_dim,
     int const num_tokens, int const nq, int const nkv, int const head_dim,
     int64_t const qkv_stride, int const block_size, int64_t const kv_s_block,
     int64_t const kv_s_head, int64_t const kv_s_token, bool const do_rope,
-    bool const insert_kv, cudaStream_t stream) {
+    bool const insert_kv, bool const shuffle_kv, int64_t const shuffle_s_block,
+    cudaStream_t stream) {
   // The group width must divide the slot count. Widen only while the grid
   // still covers a full wave; decode-sized batches keep the narrow schedule.
   int const slots_per_token = nq + nkv + (insert_kv ? nkv : 0);
@@ -543,9 +606,11 @@ void launchFusedMuseSpark(
 #define DISPATCH_ARGS(RT, HD, HPG)                                         \
   launchFusedMuseSparkTyped<scalar_t, cache_t, kv_dt, RT, HD, HPG>(        \
       qkv, reinterpret_cast<RT const*>(cos_sin_cache), positions,          \
-      slot_mapping, kv_cache, k_scale, v_scale, q_fp8_out, q_scale, eps,   \
-      rotary_dim, num_tokens, nq, nkv, qkv_stride, block_size, kv_s_block, \
-      kv_s_head, kv_s_token, do_rope, insert_kv, stream)
+      slot_mapping, kv_cache, k_scale, v_scale, q_fp8_out, q_scale,        \
+      shuffled_k_cache, shuffled_v_cache, eps, rotary_dim, num_tokens, nq, \
+      nkv,                                                                   \
+      qkv_stride, block_size, kv_s_block, kv_s_head, kv_s_token,            \
+      shuffle_s_block, do_rope, insert_kv, shuffle_kv, stream)
 
 #define DISPATCH_HPG(RT, HD)    \
   switch (heads_per_group) {    \
@@ -597,16 +662,21 @@ void launchFusedMuseSpark(
       reinterpret_cast<int64_t const*>(positions.data_ptr()),                  \
       insert_kv ? reinterpret_cast<int64_t const*>(slot_mapping->data_ptr())   \
                 : nullptr,                                                     \
-      insert_kv ? reinterpret_cast<CACHE_T*>(kv_cache->data_ptr()) : nullptr,  \
+      kv_cache ? reinterpret_cast<CACHE_T*>(kv_cache->data_ptr()) : nullptr,   \
       needs_scales ? reinterpret_cast<float const*>(k_scale->data_ptr())       \
                    : nullptr,                                                  \
       needs_scales ? reinterpret_cast<float const*>(v_scale->data_ptr())       \
                    : nullptr,                                                  \
       q_fp8_out ? reinterpret_cast<uint8_t*>(q_fp8_out->data_ptr()) : nullptr, \
       q_scale ? reinterpret_cast<float const*>(q_scale->data_ptr()) : nullptr, \
+      shuffle_kv ? reinterpret_cast<CACHE_T*>(shuffled_k_cache->data_ptr())    \
+                 : nullptr,                                                     \
+      shuffle_kv ? reinterpret_cast<CACHE_T*>(shuffled_v_cache->data_ptr())    \
+                 : nullptr,                                                     \
       static_cast<float>(eps), static_cast<int>(rotary_dim), num_tokens, nq,   \
       nkv, hd, qkv_stride, static_cast<int>(block_size), kv_s_block,           \
-      kv_s_head, kv_s_token, do_rope, insert_kv, stream)
+      kv_s_head, kv_s_token, do_rope, insert_kv, shuffle_kv, shuffle_s_block,  \
+      stream)
 // clang-format on
 
 void fused_muse_spark_qknorm_rope_kv_insert(
@@ -621,7 +691,9 @@ void fused_muse_spark_qknorm_rope_kv_insert(
     std::optional<torch::stable::Tensor> k_scale,  // [1] fp32, fp8 cache only
     std::optional<torch::stable::Tensor> v_scale,
     std::optional<torch::stable::Tensor> q_fp8_out,
-    std::optional<torch::stable::Tensor> q_scale) {
+    std::optional<torch::stable::Tensor> q_scale,
+    std::optional<torch::stable::Tensor> shuffled_k_cache,
+    std::optional<torch::stable::Tensor> shuffled_v_cache) {
   STD_TORCH_CHECK(qkv.is_cuda() && qkv.dim() == 2 && qkv.stride(1) == 1,
                   "qkv must be a 2-D CUDA tensor with a contiguous row");
   STD_TORCH_CHECK(
@@ -694,11 +766,18 @@ void fused_muse_spark_qknorm_rope_kv_insert(
 
   vllm::Fp8KVCacheDataType const kv_dt =
       vllm::get_fp8_kv_cache_data_type(kv_cache_dtype);
-  bool const insert_kv = kv_cache.has_value() && kv_cache->numel() > 0;
+  STD_TORCH_CHECK(shuffled_k_cache.has_value() == shuffled_v_cache.has_value(),
+                  "shuffled K and V caches must be provided together");
+  bool const shuffle_kv =
+      shuffled_k_cache.has_value() && shuffled_k_cache->numel() > 0;
+  STD_TORCH_CHECK(!shuffle_kv || !kv_cache.has_value() || kv_cache->numel() == 0,
+                  "packed and shuffled KV caches are mutually exclusive");
+  bool const insert_kv =
+      shuffle_kv || (kv_cache.has_value() && kv_cache->numel() > 0);
   bool const needs_scales =
       insert_kv && kv_dt != vllm::Fp8KVCacheDataType::kAuto;
 
-  int64_t kv_s_block = 0, kv_s_head = 0, kv_s_token = 0;
+  int64_t kv_s_block = 0, kv_s_head = 0, kv_s_token = 0, shuffle_s_block = 0;
   if (insert_kv) {
     STD_TORCH_CHECK(
         slot_mapping.has_value() && slot_mapping->is_cuda() &&
@@ -706,22 +785,48 @@ void fused_muse_spark_qknorm_rope_kv_insert(
         "insert mode requires an int64 CUDA slot_mapping");
     STD_TORCH_CHECK(slot_mapping->numel() >= num_tokens,
                     "slot_mapping must cover every token");
-    STD_TORCH_CHECK(kv_cache->dim() == 4 && kv_cache->stride(3) == 1,
-                    "kv_cache must be [nb, nkv, bs, 2*head_dim] with a "
-                    "contiguous content dim");
-    STD_TORCH_CHECK(kv_cache->size(3) == 2 * hd,
-                    "kv_cache content dim must be 2*head_dim");
-    STD_TORCH_CHECK(kv_cache->size(1) == nkv,
-                    "kv_cache head dim must equal num_kv_heads");
-    STD_TORCH_CHECK(kv_cache->size(2) == block_size,
-                    "kv_cache token dim must equal block_size");
+    torch::stable::Tensor const& cache_for_dtype =
+        shuffle_kv ? *shuffled_k_cache : *kv_cache;
+    if (shuffle_kv) {
+      auto check_shuffled_cache = [&](torch::stable::Tensor const& cache,
+                                      char const* name) {
+        STD_TORCH_CHECK(
+            cache.is_cuda() && cache.get_device_index() == qkv.get_device_index() &&
+                cache.dim() == 4 && cache.size(1) == block_size &&
+                cache.size(2) == nkv && cache.size(3) == hd &&
+                cache.stride(3) == 1 && cache.stride(2) == hd &&
+                cache.stride(1) == static_cast<int64_t>(nkv) * hd,
+            name, " must be a [blocks, block_size, num_kv_heads, head_dim] "
+                  "view with contiguous head_dim storage");
+      };
+      check_shuffled_cache(*shuffled_k_cache, "shuffled_k_cache");
+      check_shuffled_cache(*shuffled_v_cache, "shuffled_v_cache");
+      STD_TORCH_CHECK(shuffled_k_cache->size(0) == shuffled_v_cache->size(0) &&
+                          shuffled_k_cache->scalar_type() ==
+                              shuffled_v_cache->scalar_type(),
+                      "shuffled K and V caches must have matching shape/dtype");
+      shuffle_s_block = shuffled_k_cache->stride(0);
+    } else {
+      STD_TORCH_CHECK(kv_cache->dim() == 4 && kv_cache->stride(3) == 1,
+                      "kv_cache must be [nb, nkv, bs, 2*head_dim] with a "
+                      "contiguous content dim");
+      STD_TORCH_CHECK(kv_cache->size(3) == 2 * hd,
+                      "kv_cache content dim must be 2*head_dim");
+      STD_TORCH_CHECK(kv_cache->size(1) == nkv,
+                      "kv_cache head dim must equal num_kv_heads");
+      STD_TORCH_CHECK(kv_cache->size(2) == block_size,
+                      "kv_cache token dim must equal block_size");
+      kv_s_block = kv_cache->stride(0);
+      kv_s_head = kv_cache->stride(1);
+      kv_s_token = kv_cache->stride(2);
+    }
     if (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-      STD_TORCH_CHECK(kv_cache->scalar_type() == qkv.scalar_type(),
+      STD_TORCH_CHECK(cache_for_dtype.scalar_type() == qkv.scalar_type(),
                       "auto kv_cache dtype must match qkv");
     } else {
       STD_TORCH_CHECK(
-          kv_cache->scalar_type() == torch::headeronly::ScalarType::Byte ||
-              kv_cache->scalar_type() ==
+          cache_for_dtype.scalar_type() == torch::headeronly::ScalarType::Byte ||
+              cache_for_dtype.scalar_type() ==
                   torch::headeronly::ScalarType::Float8_e4m3fn,
           "fp8 kv_cache must use uint8 or float8_e4m3fn storage");
       STD_TORCH_CHECK(k_scale.has_value() && v_scale.has_value(),
@@ -732,9 +837,6 @@ void fused_muse_spark_qknorm_rope_kv_insert(
               v_scale->scalar_type() == torch::headeronly::ScalarType::Float,
           "k_scale and v_scale must be single fp32 values");
     }
-    kv_s_block = kv_cache->stride(0);
-    kv_s_head = kv_cache->stride(1);
-    kv_s_token = kv_cache->stride(2);
   }
 
   const torch::stable::accelerator::DeviceGuard device_guard(
