@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import functools
-
 import torch
 import torch.nn.functional as F
 
@@ -132,20 +130,46 @@ def supports_shuffled_fused_insert(attn_layer: torch.nn.Module) -> bool:
     return attn_layer.kv_cache_dtype in _SHUFFLED_KV_CACHE_DTYPES
 
 
-@functools.cache
+def graph_capture_active() -> bool:
+    """Whether this forward is recording a CUDA/HIP graph; replays run no Python."""
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+_SHUFFLED_INSERT_CONSTANTS: dict[tuple, torch.Tensor | tuple[torch.Tensor, ...]] = {}
+
+
+def _shuffled_insert_constant(key: tuple, make):
+    """Read-only constants, built eagerly so no graph pool owns them."""
+    value = _SHUFFLED_INSERT_CONSTANTS.get(key)
+    if value is None:
+        if graph_capture_active():
+            raise RuntimeError(
+                "Muse shuffled KV insert constants must be built before graph capture"
+            )
+        value = make()
+        _SHUFFLED_INSERT_CONSTANTS[key] = value
+    return value
+
+
 def unit_norm_weight(
     head_dim: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    return torch.ones(head_dim, dtype=dtype, device=device)
+    return _shuffled_insert_constant(
+        ("norm", head_dim, dtype, device),
+        lambda: torch.ones(head_dim, dtype=dtype, device=device),
+    )
 
 
-@functools.cache
 def _identity_rope(
     head_dim: int, dtype: torch.dtype, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    half = head_dim // 2
-    table = torch.cat([torch.ones(half), torch.zeros(half)]).view(1, head_dim)
-    return table.to(device, dtype), torch.zeros(1, dtype=torch.int64, device=device)
+    def make() -> tuple[torch.Tensor, torch.Tensor]:
+        half = head_dim // 2
+        table = torch.cat([torch.ones(half), torch.zeros(half)]).view(1, head_dim)
+        zero = torch.zeros(1, dtype=torch.int64, device=device)
+        return table.to(device, dtype), zero
+
+    return _shuffled_insert_constant(("nope", head_dim, dtype, device), make)
 
 
 def kernel_rope_table(rotary_emb: torch.nn.Module, dtype: torch.dtype) -> torch.Tensor:
@@ -155,6 +179,8 @@ def kernel_rope_table(rotary_emb: torch.nn.Module, dtype: torch.dtype) -> torch.
         return table
     cached = getattr(rotary_emb, "_aiter_cos_sin_cache", None)
     if cached is None or cached.dtype != dtype or cached.device != table.device:
+        if graph_capture_active():
+            raise RuntimeError("Muse AITER RoPE table must be built before capture")
         cached = table.to(dtype)
         rotary_emb._aiter_cos_sin_cache = cached
     return cached
@@ -194,6 +220,23 @@ def pad_slot_mapping(slot_mapping: torch.Tensor, num_tokens: int) -> torch.Tenso
     return F.pad(slot_mapping, (0, num_tokens - num_slots), value=PAD_SLOT_ID)
 
 
+def shuffled_insert_buffers(
+    qkv: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-forward ``(rows, q_out, slots)``.
+
+    Eager calls allocate normally. Under capture these come from vLLM's graph
+    pool and keep their addresses for replay; they are never cached here.
+    """
+    rows = qkv_rows(qkv, (num_heads + 2 * num_kv_heads) * head_dim)
+    q_out = rows.new_empty(rows.shape[0], num_heads * head_dim)
+    return rows, q_out, pad_slot_mapping(slot_mapping, rows.shape[0])
+
+
 def shuffled_fused_qk_norm_rope_kv_insert(
     qkv: torch.Tensor,
     positions: torch.Tensor,
@@ -205,18 +248,20 @@ def shuffled_fused_qk_norm_rope_kv_insert(
     eps: float,
 ) -> torch.Tensor | None:
     """Q after norm and RoPE with shuffled K/V inserted, or None with no cache."""
-    _, attn_layer, kv_cache, slot_mapping = get_attention_context(layer_name)
-    if slot_mapping is None or kv_cache.numel() == 0:
-        return None
-    rows = qkv_rows(qkv, (num_heads + 2 * num_kv_heads) * head_dim)
+    norm_weight = unit_norm_weight(head_dim, qkv.dtype, qkv.device)
     cos_sin_cache, kernel_positions, rotary_dim = kernel_rope_args(
         rotary_emb, positions, head_dim, qkv.dtype
     )
-    q_out = rows.new_empty(rows.shape[0], num_heads * head_dim)
+    _, attn_layer, kv_cache, slot_mapping = get_attention_context(layer_name)
+    if slot_mapping is None or kv_cache.numel() == 0:
+        return None
+    rows, q_out, slots = shuffled_insert_buffers(
+        qkv, slot_mapping, num_heads, num_kv_heads, head_dim
+    )
     fused_qk_norm_rope_kv_cache_update(
         qkv=rows,
-        q_weight=unit_norm_weight(head_dim, qkv.dtype, qkv.device),
-        k_weight=unit_norm_weight(head_dim, qkv.dtype, qkv.device),
+        q_weight=norm_weight,
+        k_weight=norm_weight,
         cos_sin_cache=cos_sin_cache,
         positions=kernel_positions,
         num_heads_q=num_heads,
@@ -226,7 +271,7 @@ def shuffled_fused_qk_norm_rope_kv_insert(
         rms_norm_eps=eps,
         q_out=q_out,
         kv_cache=kv_cache,
-        slot_mapping=pad_slot_mapping(slot_mapping, rows.shape[0]),
+        slot_mapping=slots,
         k_scale=attn_layer._k_scale_cpu,
         v_scale=attn_layer._v_scale_cpu,
         kv_cache_dtype=attn_layer.kv_cache_dtype,

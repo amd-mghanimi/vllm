@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Eager AMD AITER QK-norm + RoPE + KV-cache update helpers."""
+"""AMD AITER helpers for fused QK-norm, RoPE, and KV-cache updates."""
 
 import functools
 

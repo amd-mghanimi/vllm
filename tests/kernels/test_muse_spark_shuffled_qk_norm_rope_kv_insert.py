@@ -26,6 +26,7 @@ from vllm.v1.attention.backends.rocm_aiter_fa import (
     AiterFlashAttentionBackend,
     reshape_and_cache_shuffle_triton,
 )
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 pytestmark = pytest.mark.skipif(
     not shared_ops.has_aiter_qk_norm_rope_kv_cache_update(),
@@ -442,3 +443,112 @@ def test_layer_entry_point_reads_the_forward_context(
     else:
         assert int(bf16_ulp_diff(got[0], want[0]).max()) <= 2
         torch.testing.assert_close(got[1], want[1], rtol=0, atol=0)
+
+
+def assert_cache_matches_reference(got_cache, ref_cache, num_kv_heads, kv_cache_dtype):
+    got = shared_ops.split_shuffled_kv_cache(
+        got_cache, num_kv_heads, HEAD_DIM, kv_cache_dtype
+    )
+    want = shared_ops.split_shuffled_kv_cache(
+        ref_cache, num_kv_heads, HEAD_DIM, kv_cache_dtype
+    )
+    if kv_cache_dtype == "fp8":
+        assert_fp8_codes_close(got[0], want[0])
+        assert_fp8_codes_close(got[1], want[1])
+    else:
+        assert int(bf16_ulp_diff(got[0], want[0]).max()) <= 2
+        torch.testing.assert_close(got[1], want[1], rtol=0, atol=0)
+
+
+def cumulative_allocations():
+    """Allocation count and bytes ever handed out; frees do not lower them."""
+    stats = torch.cuda.memory_stats()
+    return stats["allocation.all.allocated"], stats["allocated_bytes.all.allocated"]
+
+
+def fill_graph_inputs(qkv, positions, slots, cache, initial_cache, seed):
+    """Mutate captured inputs in place to prove replay reads live buffers."""
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+    qkv.copy_(torch.randn(qkv.shape, generator=gen, device=DEVICE, dtype=qkv.dtype) * 4)
+    positions.copy_(
+        torch.randint(0, MAX_POS, positions.shape, generator=gen, device=DEVICE)
+    )
+    real = torch.randperm(cache.shape[0] * cache.shape[2], device=DEVICE)
+    slots.copy_(real[: slots.numel()])
+    slots[1] = PAD_SLOT_ID
+    slots[-4:] = PAD_SLOT_ID
+    cache.copy_(initial_cache)
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("rotary_dim", [HEAD_DIM, 0], ids=["rope", "nope"])
+@pytest.mark.parametrize("num_slots", [19, 15], ids=["runner-padded", "short"])
+def test_cuda_graph_replay_matches_unfused_shuffle_path(
+    monkeypatch, shuffle_on, kv_cache_dtype, rotary_dim, num_slots
+):
+    """Capture once, mutate inputs, replay, and compare to fresh references."""
+    num_heads, num_kv_heads, num_tokens, block_size = 16, 2, 19, 16
+    q_size, kv_size = num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
+    qkv = torch.empty(
+        num_tokens, 2 * q_size + 2 * kv_size, dtype=torch.bfloat16, device=DEVICE
+    )
+    positions = torch.empty(num_tokens, dtype=torch.int64, device=DEVICE)
+    slots = torch.empty(num_slots, dtype=torch.int64, device=DEVICE)
+    initial_cache = make_kv_cache(8, block_size, num_kv_heads, kv_cache_dtype, True)
+    cache = initial_cache.transpose(0, 1).clone().transpose(0, 1)
+    layer = SimpleNamespace(
+        kv_cache_dtype=kv_cache_dtype,
+        _k_scale_cpu=torch.tensor(1.0),
+        _v_scale_cpu=torch.tensor(1.0),
+    )
+    monkeypatch.setattr(
+        shuffle_ops, "get_attention_context", lambda name: (None, layer, cache, slots)
+    )
+    rope = make_rope(rotary_dim) if rotary_dim else None
+    args = (qkv, positions, rope, "layer", num_heads, num_kv_heads, HEAD_DIM, EPS)
+
+    # vLLM performs an eager warmup before capture; it also builds constants.
+    fill_graph_inputs(qkv, positions, slots, cache, initial_cache, seed=0)
+    shuffle_ops.shuffled_fused_qk_norm_rope_kv_insert(*args)
+    torch.accelerator.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
+        q_graph = shuffle_ops.shuffled_fused_qk_norm_rope_kv_insert(*args)
+    assert q_graph is not None
+    q_ptr = q_graph.data_ptr()
+
+    for seed in (1, 2):
+        fill_graph_inputs(qkv, positions, slots, cache, initial_cache, seed)
+        torch.accelerator.synchronize()
+        allocations = cumulative_allocations()
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert cumulative_allocations() == allocations
+        assert q_graph.data_ptr() == q_ptr
+
+        ref_cache = initial_cache.transpose(0, 1).clone().transpose(0, 1)
+        ref_q = unfused_shuffle_reference(
+            qkv.clone(),
+            positions.clone(),
+            make_rope(rotary_dim) if rotary_dim else None,
+            num_heads,
+            num_kv_heads,
+            *shared_ops.split_shuffled_kv_cache(
+                ref_cache, num_kv_heads, HEAD_DIM, kv_cache_dtype
+            ),
+            shuffle_ops.pad_slot_mapping(slots.clone(), num_tokens),
+            kv_cache_dtype,
+            1.0,
+        )
+        assert int(bf16_ulp_diff(q_graph, ref_q).max()) <= 2
+        assert_cache_matches_reference(cache, ref_cache, num_kv_heads, kv_cache_dtype)
+
+
+def test_graph_capture_rejects_lazy_constants():
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="before graph capture"),
+        torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()),
+    ):
+        shuffle_ops.unit_norm_weight(512, torch.bfloat16, torch.device(DEVICE))
