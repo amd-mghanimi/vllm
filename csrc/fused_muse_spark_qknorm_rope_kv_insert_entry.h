@@ -31,7 +31,9 @@
       std::optional<torch::stable::Tensor> k_scale,                           \
       std::optional<torch::stable::Tensor> v_scale,                           \
       std::optional<torch::stable::Tensor> q_fp8_out,                         \
-      std::optional<torch::stable::Tensor> q_scale
+      std::optional<torch::stable::Tensor> q_scale,                           \
+      std::optional<torch::stable::Tensor> shuffled_k_cache,                  \
+      std::optional<torch::stable::Tensor> shuffled_v_cache
 
 // One instantiation per supported head_dim; EXT is `extern` to name an
 // instantiation that another unit provides, and empty in the unit that

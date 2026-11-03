@@ -10,17 +10,20 @@ void fused_muse_spark_qknorm_rope_kv_insert(VLLM_MUSE_SPARK_ENTRY_SIG) {
       return fused_muse_spark_qknorm_rope_kv_insert_typed<64>(
           qkv, positions, num_heads, num_kv_heads, head_dim, eps, cos_sin_cache,
           rotary_dim, slot_mapping, kv_cache, block_size, kv_cache_dtype,
-          k_scale, v_scale, q_fp8_out, q_scale);
+          k_scale, v_scale, q_fp8_out, q_scale, shuffled_k_cache,
+          shuffled_v_cache);
     case 128:
       return fused_muse_spark_qknorm_rope_kv_insert_typed<128>(
           qkv, positions, num_heads, num_kv_heads, head_dim, eps, cos_sin_cache,
           rotary_dim, slot_mapping, kv_cache, block_size, kv_cache_dtype,
-          k_scale, v_scale, q_fp8_out, q_scale);
+          k_scale, v_scale, q_fp8_out, q_scale, shuffled_k_cache,
+          shuffled_v_cache);
     case 256:
       return fused_muse_spark_qknorm_rope_kv_insert_typed<256>(
           qkv, positions, num_heads, num_kv_heads, head_dim, eps, cos_sin_cache,
           rotary_dim, slot_mapping, kv_cache, block_size, kv_cache_dtype,
-          k_scale, v_scale, q_fp8_out, q_scale);
+          k_scale, v_scale, q_fp8_out, q_scale, shuffled_k_cache,
+          shuffled_v_cache);
     default:
       STD_TORCH_CHECK(false, "unsupported head_dim: ", head_dim);
   }
