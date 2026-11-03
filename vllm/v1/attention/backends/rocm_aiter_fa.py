@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import functools
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
@@ -47,6 +48,25 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 # past this; speculative rows (q = 1 + K) fall back to shuffled unified
 # attention until the assert is raised.
 _SHUFFLE_GLUON_MAX_QUERY_LEN = 4
+# pa_decode_gluon also asserts query_length * (q heads per KV head) <= 64.
+_SHUFFLE_GLUON_MAX_QUERY_GROUP = 64
+
+
+@functools.cache
+def _pa_decode_gluon():
+    """aiter's pa_decode_gluon, or None where it cannot run: it asserts
+    CDNA3/CDNA4, and older aiter builds do not ship it."""
+    from vllm.platforms.rocm import get_cdna_version
+
+    if get_cdna_version() not in (3, 4):
+        return None
+    try:
+        from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+    except ImportError:
+        return None
+    return pa_decode_gluon
+
+
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
@@ -512,6 +532,17 @@ class AiterFlashAttentionMetadataBuilder(
                 )
                 self.aot_sliding_window = sliding_window_config
 
+        if (
+            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            and is_quantized_kv_cache(vllm_config.cache_config.cache_dtype)
+            and self.reorder_batch_threshold > 1
+        ):
+            logger.warning_once(
+                "Shuffle KV cache layout with an fp8 KV cache and multi-token "
+                "decode: those rows run the Triton shuffled kernel, which can "
+                "be about 2x slower than the unshuffled layout."
+            )
+
         # Persistent so full CUDA graphs keep reading the same storage.
         self._swa_block_table: torch.Tensor | None = None
         self._swa_seq_lens: torch.Tensor | None = None
@@ -572,6 +603,13 @@ class AiterFlashAttentionMetadataBuilder(
             return None, None, 0
         assert self._swa_seq_lens is not None and self._swa_block_offsets is not None
         window = self.aot_sliding_window[0] + max_query_len
+        # The buffer was sized for the decode threshold at init; a kept span
+        # of up to window + block_size - 1 tokens must fit in it.
+        if (
+            cdiv(window + self.block_size - 1, self.block_size)
+            > self._swa_block_table.shape[1]
+        ):
+            return None, None, 0
         lens = seq_lens[:num_decodes]
         first_block = torch.clamp(lens - window, min=0) // self.block_size
         index = (first_block.to(torch.int64)[:, None] + self._swa_block_offsets).clamp_(
@@ -1006,7 +1044,8 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_non_causal(cls) -> bool:
-        return True
+        # The shuffle layout has no non-causal multi-token decode kernel.
+        return not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
 
 
 class AiterFlashAttentionImpl(AttentionImpl):
@@ -1045,6 +1084,16 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+
+        if rocm_aiter_ops.is_shuffle_kv_cache_enabled() and (
+            alibi_slopes is not None or logits_soft_cap
+        ):
+            # paged_attention_common, the single-token full-attention decode
+            # kernel for this layout, takes neither.
+            raise NotImplementedError(
+                "ALiBi and logits soft cap are not supported with the shuffle "
+                "KV cache layout; unset VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT."
+            )
 
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
@@ -1565,10 +1614,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 # paged_attention_common addresses pages arithmetically and
                 # needs K and V as dense planes (LHBNC). A block-compact
                 # layout (LBHNC, chosen when a draft spec mixes HNC shapes)
-                # interleaves the two sides, so read it by stride. Non-causal
-                # rows have no shuffle kernel either; fail there instead of
-                # running the causal paged kernel.
-                key_cache.stride(0) != key_cache[0].numel() or not attn_metadata.causal
+                # interleaves the two sides, so read it by stride.
+                key_cache.stride(0) != key_cache[0].numel()
             ):
                 k_descale, v_descale = self._get_kv_cache_descales(layer, num_decodes)
                 self._shuffle_decode(
@@ -1723,7 +1770,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
         keeps it from scanning the whole context), and the rest to shuffled
         ``unified_attention``.
         """
-        if not attn_metadata.causal:
+        # A single trailing query sees the same keys either way.
+        if not attn_metadata.causal and decode_max_query_len > 1:
             raise NotImplementedError(
                 "Shuffle KV cache layout has no non-causal decode kernel. "
                 "Run a non-causal drafter on a backend that keeps its own "
@@ -1737,43 +1785,40 @@ class AiterFlashAttentionImpl(AttentionImpl):
         )
         uniform = num_decode_tokens == num_decodes * decode_max_query_len
         decode_md = attn_metadata.decode_metadata
-        swa = self.sliding_window[0] != -1
+        # Gluon only on the window-trimmed table: over the whole context it
+        # is slower than unified attention.
         if (
-            swa
+            self.sliding_window[0] != -1
             and uniform
             and decode_max_query_len <= _SHUFFLE_GLUON_MAX_QUERY_LEN
+            and decode_max_query_len * self.num_queries_per_kv
+            <= _SHUFFLE_GLUON_MAX_QUERY_GROUP
             and block_size in (16, 64)
-            and self.alibi_slopes is None
-            and not self.logits_soft_cap
+            and decode_md is not None
+            and decode_md.swa_block_table is not None
+            and (pa_decode_gluon := _pa_decode_gluon()) is not None
         ):
-            from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
-
+            assert decode_md.swa_seq_lens is not None
             fp8 = is_quantized_kv_cache(self.kv_cache_dtype)
-            if decode_md is not None and decode_md.swa_block_table is not None:
-                assert decode_md.swa_seq_lens is not None
-                block_table = decode_md.swa_block_table
-                seq_lens = decode_md.swa_seq_lens
-                max_seq_len = decode_md.swa_max_seq_len
-            else:
-                block_table = attn_metadata.block_table[:num_decodes]
-                seq_lens = attn_metadata.seq_lens[:num_decodes]
-                max_seq_len = attn_metadata.max_seq_len
             pa_decode_gluon(
                 output[:num_decode_tokens],
                 query[:num_decode_tokens],
                 k,
                 v,
-                seq_lens,
-                block_table,
+                decode_md.swa_seq_lens,
+                decode_md.swa_block_table,
                 self.scale,
                 decode_max_query_len,
-                cdiv(max_seq_len, _PARTITION_SIZE_ROCM),
+                cdiv(decode_md.swa_max_seq_len, _PARTITION_SIZE_ROCM),
                 _PARTITION_SIZE_ROCM,
                 compute_type=query.dtype,
                 key_scale=layer._k_scale if fp8 else None,
                 value_scale=layer._v_scale if fp8 else None,
                 sinks=self.sinks,
-                sliding_window=self.sliding_window[0] + 1,
+                # The persistent kernel counts the window back from the end of
+                # the context, the query rows included: row r keeps keys from
+                # context_length - sliding_window + r + 1.
+                sliding_window=self.sliding_window[0] + 1 + decode_max_query_len,
             )
             return
         from aiter.ops.triton.unified_attention import unified_attention
