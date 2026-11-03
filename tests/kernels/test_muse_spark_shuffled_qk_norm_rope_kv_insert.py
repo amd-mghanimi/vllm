@@ -16,8 +16,8 @@ from vllm.platforms import current_platform
 if not current_platform.is_rocm() or not torch.cuda.is_available():
     pytest.skip("AITER shuffle KV insert requires ROCm", allow_module_level=True)
 
-import vllm.models.common.ops.fused_qk_norm_rope_kv_amd as shared_ops
-import vllm.models.muse_spark.amd.ops.fused_qk_norm_rope_shuffle_kv as shuffle_ops
+import vllm.models.common.amd.ops.fused_qk_norm_rope_kv as shared_ops
+import vllm.models.muse_spark.amd.ops.fused_qk_norm_rope_kv as shuffle_ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
@@ -132,23 +132,30 @@ def run_fused(
     cos_sin, kernel_positions, rotary_dim = shuffle_ops.kernel_rope_args(
         rotary_emb, positions, HEAD_DIM, qkv.dtype
     )
+    weight = shuffle_ops.unit_norm_weight(HEAD_DIM, qkv.dtype, qkv.device)
     scale = torch.tensor(k_scale, dtype=torch.float32)
-    return shuffle_ops.aiter_qk_norm_rope_shuffled_insert(
-        rows,
-        kernel_positions,
-        cos_sin,
-        rotary_dim,
-        shuffle_ops.unit_norm_weight(HEAD_DIM, qkv.dtype, qkv.device),
-        num_heads,
-        num_kv_heads,
-        HEAD_DIM,
-        EPS,
-        kv_cache,
-        shuffle_ops.pad_slot_mapping(slot_mapping, rows.shape[0]),
-        scale,
-        scale,
-        kv_cache_dtype,
+    q_out = rows.new_empty(rows.shape[0], num_heads * HEAD_DIM)
+    shared_ops.fused_qk_norm_rope_kv_cache_update(
+        qkv=rows,
+        q_weight=weight,
+        k_weight=weight,
+        cos_sin_cache=cos_sin,
+        positions=kernel_positions,
+        num_heads_q=num_heads,
+        num_heads_k=num_kv_heads,
+        head_dim=HEAD_DIM,
+        is_neox=False,
+        rms_norm_eps=EPS,
+        q_out=q_out,
+        kv_cache=kv_cache,
+        slot_mapping=shuffle_ops.pad_slot_mapping(slot_mapping, rows.shape[0]),
+        k_scale=scale,
+        v_scale=scale,
+        kv_cache_dtype=kv_cache_dtype,
+        rotary_dim=rotary_dim,
+        use_shuffle_layout=True,
     )
+    return q_out
 
 
 def bf16_ulp_diff(got, expected):

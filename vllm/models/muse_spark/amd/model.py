@@ -76,8 +76,8 @@ from .muse_moe_runner import (
     MuseSparkRoutedExperts,
 )
 from .ops.fused_norm_expand import fused_rmsnorm_expand
-from .ops.fused_qk_norm_rope_kv import rocm_fused_qk_norm_rope_kv_insert
-from .ops.fused_qk_norm_rope_shuffle_kv import (
+from .ops.fused_qk_norm_rope_kv import (
+    rocm_fused_qk_norm_rope_kv_insert,
     shuffled_fused_qk_norm_rope_kv_insert,
     supports_shuffled_fused_insert,
 )
