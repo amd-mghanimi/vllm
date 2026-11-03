@@ -391,7 +391,9 @@ void fused_muse_spark_qknorm_rope_kv_insert(
     std::optional<torch::stable::Tensor> k_scale,
     std::optional<torch::stable::Tensor> v_scale,
     std::optional<torch::stable::Tensor> q_fp8_out,
-    std::optional<torch::stable::Tensor> q_scale);
+    std::optional<torch::stable::Tensor> q_scale,
+    std::optional<torch::stable::Tensor> shuffled_k_cache,
+    std::optional<torch::stable::Tensor> shuffled_v_cache);
 
 // Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE (+ optional KV /
 // index-cache insert). Dense layer: norm+RoPE only; sparse layer: also packs

@@ -933,6 +933,9 @@ class AiterFlashAttentionBackend(AttentionBackend):
     supports_kv_cache_update_bypass: bool = (
         not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
     )
+    # The Muse-Spark fused writer has a shuffle-layout specialization. Keep
+    # generic external writers on the packed-layout-only bypass capability.
+    supports_muse_spark_fused_kv_insert: bool = True
 
     @staticmethod
     def get_name() -> str:

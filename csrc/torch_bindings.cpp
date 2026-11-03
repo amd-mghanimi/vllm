@@ -527,7 +527,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int head_dim, float eps, Tensor? cos_sin_cache, int rotary_dim, "
       "Tensor? slot_mapping, Tensor!? kv_cache, int block_size, "
       "str kv_cache_dtype, Tensor? k_scale=None, Tensor? v_scale=None, "
-      "Tensor!? q_fp8_out=None, Tensor? q_scale=None) "
+      "Tensor!? q_fp8_out=None, Tensor? q_scale=None, "
+      "Tensor? shuffled_k_cache=None, Tensor? shuffled_v_cache=None) "
       "-> ()");
 
   // Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE + KV-insert.

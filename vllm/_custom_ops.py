@@ -2958,6 +2958,8 @@ def fused_muse_spark_qknorm_rope_kv_insert(
     v_scale: torch.Tensor | None = None,
     q_fp8_out: torch.Tensor | None = None,
     q_scale: torch.Tensor | None = None,
+    shuffled_k_cache: torch.Tensor | None = None,
+    shuffled_v_cache: torch.Tensor | None = None,
 ) -> None:
     """In-place weightless QK RMSNorm + GPT-J RoPE, optionally writing k/v to cache.
 
@@ -2981,6 +2983,8 @@ def fused_muse_spark_qknorm_rope_kv_insert(
         v_scale,
         q_fp8_out,
         q_scale,
+        shuffled_k_cache,
+        shuffled_v_cache,
     )
 
 
