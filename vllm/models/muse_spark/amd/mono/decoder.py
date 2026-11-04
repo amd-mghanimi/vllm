@@ -230,7 +230,11 @@ def config_refusals(config: Any) -> list[str]:
 
 
 def deployment_refusals(
-    vllm_config: Any, tp_rank: int, tp_size: int, moe_parallel: Any
+    vllm_config: Any,
+    tp_rank: int,
+    tp_size: int,
+    moe_parallel: Any,
+    shuffled_kv: bool = False,
 ) -> list[str]:
     """Parallel layout and server features the monokernel does not support."""
     reasons = []
@@ -276,6 +280,8 @@ def deployment_refusals(
         reasons.append("KV offloading on")
     if cache.cache_dtype not in ("auto", "bfloat16"):
         reasons.append(f"kv_cache_dtype={cache.cache_dtype} (kernel: bf16)")
+    if shuffled_kv:
+        reasons.append("ROCm shuffle KV cache layout (kernel: dense LBHNC pages)")
     if vllm_config.model_config.dtype != torch.bfloat16:
         reasons.append(f"model dtype {vllm_config.model_config.dtype}")
     return reasons
@@ -373,10 +379,19 @@ def layer_refusals(model: nn.Module, dims: MonoDims) -> list[str]:
     return reasons
 
 
-def kv_cache_refusal(kv_cache: torch.Tensor, kv_heads: int) -> str | None:
-    """K3 writes bf16 LBHNC pages: ``[block][kv head][16 tokens][K | V]``."""
+def kv_cache_refusal(
+    kv_cache: torch.Tensor, kv_heads: int, shuffled: bool = False
+) -> str | None:
+    """K3 writes bf16 LBHNC pages: ``[block][kv head][16 tokens][K | V]``.
+
+    A shuffled cache is refused by layout, not by shape: under LBHNC its
+    ``[block][K | V slot][16 tokens][heads x 64]`` view has the dense shape
+    and strides when there are 2 kv heads.
+    """
     if kv_cache.numel() == 0:
         return "kv:unbound"
+    if shuffled:
+        return "kv:shuffled"
     if kv_cache.dtype != torch.bfloat16:
         return f"kv:{kv_cache.dtype}"
     want_shape = (kv_heads, KV_BLOCK_SIZE, 2 * 64)
@@ -833,9 +848,11 @@ class MuseSparkMono:
         dims: MonoDims,
         buckets: Sequence[int],
         fused_attention: dict[int, str],
+        shuffled_kv: bool = False,
     ) -> None:
         self.rank = rank
         self.dims = dims
+        self.shuffled_kv = shuffled_kv
         self.refresh_weights(model)
         self.buckets: dict[int, _Bucket] = {}
         for b in buckets:
@@ -901,7 +918,9 @@ class MuseSparkMono:
             return "positions"
         for name in names[1:]:
             _, _, kv_cache, slots = get_attention_context(name)
-            reason = kv_cache_refusal(kv_cache, self.dims.local_kv_heads)
+            reason = kv_cache_refusal(
+                kv_cache, self.dims.local_kv_heads, self.shuffled_kv
+            )
             if reason is not None:
                 return reason
             if (

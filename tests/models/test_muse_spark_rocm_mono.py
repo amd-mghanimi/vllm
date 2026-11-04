@@ -284,6 +284,42 @@ def test_kv_cache_guard_accepts_only_dense_bf16_lbhnc() -> None:
     assert kv_cache_refusal(torch.empty(0, dtype=torch.bfloat16), 2) == "kv:unbound"
 
 
+def _shuffled_cache_view(layout) -> torch.Tensor:
+    """A TP8 rank's layer view as the allocator builds it for the AITER
+    shuffle layout: K and V as two head slots of ``heads x 64`` (customize_spec)."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheTensor,
+        compute_layout_strides,
+        create_kv_cache_views,
+    )
+
+    dense = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+    )
+    spec = dataclasses.replace(dense, num_head_slots=2, state_content_bytes=2 * 64 * 2)
+    num_blocks = 10
+    layer_stride, block_stride, *_ = compute_layout_strides(spec, num_blocks, 1, layout)
+    size = num_blocks * spec.page_size_bytes
+    tensor = KVCacheTensor(
+        size=size, layers=["l"], layer_stride=layer_stride, block_stride=block_stride
+    )
+    raw = torch.empty(size, dtype=torch.int8, device="meta")
+    return create_kv_cache_views(raw, spec, num_blocks, layout, tensor)[0]
+
+
+@pytest.mark.parametrize("layout", ["LHBNC", "LBHNC"])
+def test_kv_cache_guard_refuses_the_shuffle_layout(layout) -> None:
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    view = _shuffled_cache_view(KVCacheLayout[layout])
+    if layout == "LBHNC":
+        # The K / V slot dim stands where the 2 kv heads of a dense page are.
+        dense = torch.empty(10, 2, 16, 128, dtype=torch.bfloat16, device="meta")
+        assert (view.shape, view.stride()) == (dense.shape, dense.stride())
+    assert kv_cache_refusal(view, 2, shuffled=True) == "kv:shuffled"
+
+
 def test_config_guard_accepts_only_the_checkpoint_shape() -> None:
     assert config_refusals(MuseSparkTextConfig(**CHECKPOINT_TEXT)) == []
     assert config_refusals(MuseSparkTextConfig(**TINY_TEXT)) == [
@@ -337,6 +373,10 @@ def test_deployment_guard_accepts_only_tep8_with_dspark(checkpoints) -> None:
         "sleep mode on",
         "weight transfer on",
         "kv_cache_dtype=fp8 (kernel: bf16)",
+    ]
+
+    assert deployment_refusals(tep8, 3, 8, _moe_parallel(), shuffled_kv=True) == [
+        "ROCm shuffle KV cache layout (kernel: dense LBHNC pages)"
     ]
 
 
