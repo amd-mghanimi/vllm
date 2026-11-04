@@ -16,6 +16,7 @@ from vllm.platforms import current_platform
 
 from .decoder import (
     FIRST_LAYER,
+    FP8_KV_CACHE_DTYPES,
     LAST_LAYER,
     NUM_CUS,
     MonoDims,
@@ -140,6 +141,7 @@ def maybe_attach_mono(lm: nn.Module) -> None:
         buckets=buckets,
         fused_attention=fused,
         shuffled_kv=_shuffled_kv(),
+        fp8_kv=lm.vllm_config.cache_config.cache_dtype in FP8_KV_CACHE_DTYPES,
     )
     logger.info(
         "Muse Spark monokernel attached: layers %d-%d of verify steps with "

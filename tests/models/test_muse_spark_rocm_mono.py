@@ -48,6 +48,7 @@ from vllm.models.muse_spark.amd.mono.decoder import (
     fused_attention_layers,
     kv_cache_refusal,
     kv_launch_args,
+    kv_scales,
     layer_refusals,
 )
 from vllm.platforms import current_platform
@@ -285,7 +286,7 @@ def test_kv_cache_guard_accepts_only_dense_bf16_lbhnc() -> None:
     assert kv_cache_refusal(torch.empty(0, dtype=torch.bfloat16), 2) == "kv:unbound"
 
 
-def _shuffled_cache_view(layout) -> torch.Tensor:
+def _shuffled_cache_view(layout, dtype=torch.bfloat16) -> torch.Tensor:
     """A TP8 rank's layer view as the allocator builds it for the AITER
     shuffle layout: K and V as two head slots of ``heads x 64`` (customize_spec)."""
     from vllm.v1.kv_cache_interface import (
@@ -295,10 +296,12 @@ def _shuffled_cache_view(layout) -> torch.Tensor:
         create_kv_cache_views,
     )
 
-    dense = FullAttentionSpec(
-        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+    dense = FullAttentionSpec(block_size=16, num_kv_heads=2, head_size=64, dtype=dtype)
+    spec = dataclasses.replace(
+        dense,
+        num_head_slots=2,
+        state_content_bytes=2 * 64 * torch.empty((), dtype=dtype).element_size(),
     )
-    spec = dataclasses.replace(dense, num_head_slots=2, state_content_bytes=2 * 64 * 2)
     num_blocks = 10
     layer_stride, block_stride, *_ = compute_layout_strides(spec, num_blocks, 1, layout)
     size = num_blocks * spec.page_size_bytes
@@ -319,6 +322,8 @@ def test_kv_cache_guard_follows_the_shuffle_layout(layout) -> None:
         view.data_ptr(),
         view.stride(0),
         view.data_ptr() + view.stride(1) * view.element_size(),
+        0,
+        0,
     )
     if layout == "LBHNC":
         # The K / V slot dim stands where the 2 kv heads of a dense page are:
@@ -333,6 +338,52 @@ def test_kv_cache_guard_follows_the_shuffle_layout(layout) -> None:
     assert kv_cache_refusal(
         overlap.as_strided(overlap.shape, (2048, 64, 128, 1)), 2, shuffled=True
     ).startswith("kv:shuffled-stride")
+
+
+@pytest.mark.parametrize("storage", [torch.uint8, torch.float8_e4m3fn])
+@pytest.mark.parametrize("layout", ["dense", "LHBNC", "LBHNC"])
+def test_kv_cache_guard_follows_the_cache_dtype(storage, layout) -> None:
+    """The fp8 builds take e4m3 storage in the bf16 element layout (strides
+    in elements); a bf16 build never takes an fp8 cache, nor the reverse."""
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    shuffled = layout != "dense"
+    if shuffled:
+        fp8 = _shuffled_cache_view(KVCacheLayout[layout], storage)
+        bf16 = _shuffled_cache_view(KVCacheLayout[layout])
+        assert fp8.stride() == bf16.stride()
+    else:
+        fp8 = torch.empty(10, 2, 16, 128, dtype=storage, device="meta")
+        bf16 = torch.empty(10, 2, 16, 128, dtype=torch.bfloat16, device="meta")
+    assert kv_cache_refusal(fp8, 2, shuffled, fp8=True) is None
+    assert kv_cache_refusal(bf16, 2, shuffled) is None
+    assert kv_cache_refusal(fp8, 2, shuffled) == f"kv:{storage}"
+    assert kv_cache_refusal(bf16, 2, shuffled, fp8=True) == "kv:torch.bfloat16"
+    for other in (torch.float8_e5m2, torch.float8_e4m3fnuz, torch.int8):
+        assert kv_cache_refusal(fp8.view(other), 2, shuffled, fp8=True) == f"kv:{other}"
+    scales = (torch.ones(1, device="meta"), torch.ones(1, device="meta"))
+    _, _, v_plane, *_ = kv_launch_args(fp8, shuffled, scales)
+    assert v_plane == fp8.data_ptr() + (fp8.stride(1) if shuffled else 0)
+    if shuffled:
+        overlap = torch.empty(10, 2, 16, 128, dtype=storage, device="meta")
+        assert kv_cache_refusal(
+            overlap.as_strided(overlap.shape, (2048, 64, 128, 1)), 2, True, fp8=True
+        ).startswith("kv:shuffled-stride")
+
+
+def test_kv_scales_guard_needs_both_fp32_scales() -> None:
+    cache = torch.empty(10, 2, 16, 128, dtype=torch.uint8, device="meta")
+
+    def layer(k, v):
+        return dataclasses.make_dataclass("L", ["_k_scale", "_v_scale"])(k, v)
+
+    one = torch.ones((), dtype=torch.float32, device="meta")
+    assert kv_scales(layer(one, one), cache) == (one, one)
+    assert kv_scales(layer(one, None), cache) is None
+    assert kv_scales(layer(one.half(), one), cache) is None
+    assert kv_scales(layer(one, torch.ones(2, device="meta")), cache) is None
+    assert kv_scales(layer(one, torch.ones(())), cache) is None  # host copy
+    assert kv_scales(torch.nn.Module(), cache) is None
 
 
 def test_config_guard_accepts_only_the_checkpoint_shape() -> None:
@@ -378,7 +429,7 @@ def test_deployment_guard_accepts_only_tep8_with_dspark(checkpoints) -> None:
         "MoE layers not expert parallel",
     ]
 
-    no_draft = _vllm_config(tiny, tp=8, cache_dtype="fp8")
+    no_draft = _vllm_config(tiny, tp=8, cache_dtype="fp8_e5m2")
     no_draft.lora_config = LoRAConfig()
     no_draft.model_config.enable_sleep_mode = True
     no_draft.weight_transfer_config = WeightTransferConfig()
@@ -387,8 +438,12 @@ def test_deployment_guard_accepts_only_tep8_with_dspark(checkpoints) -> None:
         "LoRA on",
         "sleep mode on",
         "weight transfer on",
-        "kv_cache_dtype=fp8 (kernel: bf16)",
+        "kv_cache_dtype=fp8_e5m2 (kernel: bf16, fp8_e4m3)",
     ]
+    # The fp8 builds quantize / dequantize the e4m3 cache (Build.fp8).
+    for dtype in ("fp8", "fp8_e4m3"):
+        fp8 = _vllm_config(tiny, dspark, tp=8, cache_dtype=dtype)
+        assert deployment_refusals(fp8, 3, 8, _moe_parallel()) == []
 
     # The builds read and write the shuffled planes (Build.shuffle).
     assert deployment_refusals(tep8, 3, 8, _moe_parallel(), shuffled_kv=True) == []
@@ -561,8 +616,8 @@ def test_fused_attention_layers_follow_the_window(tiny_model) -> None:
 _K3_HEAD = (
     "attn_o attn_g stream_pre w_o alpha_a beta_a w_pffn w_r bias w_pre w_pren "
     "w13 w13s w2 w2s w_post w_pp w_pff alpha beta w_in w_qkvg stream_out xn_out "
-    "part_out q_out g_out k_cache v_cache v_plane slots cos_sin pos scratch epoch "
-    "health tl"
+    "part_out q_out g_out k_cache v_cache v_plane k_scale v_scale slots cos_sin pos "
+    "scratch epoch health tl"
 )
 _HA_HEAD = (
     "attn_o attn_g stream_in w_o alpha_a beta_a w_pffn w_r bias w_pre w_pren "
@@ -571,10 +626,11 @@ _HA_HEAD = (
 _HM_HEAD = "h ids sc w13 w13s w2 w2s w_post part_out scratch epoch health tl"
 _HB_HEAD = (
     "part w_pp w_pff alpha beta w_in w_qkvg stream_out sfull_out q_out g_out "
-    "k_cache v_cache v_plane slots cos_sin pos scratch epoch health tl"
+    "k_cache v_cache v_plane k_scale v_scale slots cos_sin pos scratch epoch health "
+    "tl"
 )
 _REPLICAS = " w13r w13sr w2r w2sr eptab"
-_DESC_WORDS = 12
+_DESC_WORDS = 14
 
 
 def _params(head: str, world_size: int, tail: str) -> list[str]:
@@ -604,9 +660,11 @@ class StockLaunches:
     """The FlyDSL monokernel sources, with each launch running the stock layer
     pieces it replaces on the memory at its arguments' pointers."""
 
-    def __init__(self, model, dims: MonoDims, bnd: int, shuffled: bool = False) -> None:
+    def __init__(
+        self, model, dims: MonoDims, bnd: int, shuffled: bool = False, fp8: bool = False
+    ) -> None:
         self.model, self.dims, self.bnd = model, dims, bnd
-        self.shuffled = shuffled
+        self.shuffled, self.fp8 = shuffled, fp8
         self.calls: list[tuple[str, dict]] = []
         self.pending: dict[int, dict] = {}
         self.keys: set[tuple[str, Any]] = set()
@@ -637,8 +695,11 @@ class StockLaunches:
         if not fused:
             return _device_view(attn_o, (rows, d.q_rows), torch.bfloat16)
         words = _device_view(attn_o, (_DESC_WORDS,), torch.int64).tolist()
-        md, _, kv_cache, _ = _attention_context(layer)
-        k_cache, v_cache, v_plane = kv_launch_args(kv_cache, self.shuffled)
+        md, attn_layer, kv_cache, _ = _attention_context(layer)
+        scales = kv_scales(attn_layer, kv_cache) if self.fp8 else None
+        k_cache, v_cache, v_plane, k_scale, v_scale = kv_launch_args(
+            kv_cache, self.shuffled, scales
+        )
         assert words[1:5] == [
             k_cache,
             v_cache,
@@ -646,7 +707,7 @@ class StockLaunches:
             md.seq_lens.data_ptr(),
         ]
         assert words[8] == nreq
-        assert words[10] == v_plane
+        assert words[10:13] == [v_plane, k_scale, v_scale]
         q = _device_view(words[0], (rows, d.q_rows), torch.bfloat16)
         out = _device_view(words[5], (rows, d.q_rows), torch.bfloat16)
         out.copy_(layer.self_attn.attn(q, None, None))
@@ -663,9 +724,11 @@ class StockLaunches:
         )
         stream = _device_view(a["stream"], (rows, d.hidden_size), torch.float32)
         positions = _device_view(b["pos"], (rows,), torch.int64)
-        _, _, kv_cache, slots = _attention_context(nxt)
-        assert (b["k_cache"], b["v_cache"], b["v_plane"]) == kv_launch_args(
-            kv_cache, self.shuffled
+        _, attn_layer, kv_cache, slots = _attention_context(nxt)
+        scales = kv_scales(attn_layer, kv_cache) if self.fp8 else None
+        kv = ("k_cache", "v_cache", "v_plane", "k_scale", "v_scale")
+        assert tuple(b[n] for n in kv) == kv_launch_args(
+            kv_cache, self.shuffled, scales
         )
         assert b["slots"] == slots.data_ptr()
         rope = nxt.self_attn.rotary_emb
@@ -692,6 +755,7 @@ class _Key:
     attn: str = ""
     bnd: int = 0
     shuffle: bool = False
+    fp8: bool = False
 
 
 class _Kernel:
@@ -710,9 +774,9 @@ class _Kernel:
     def scratch_layout(self, S, W=1, bnd=0):
         return {}, 4096
 
-    def build_vllm(self, S, W, next_rope=True, attn="", shuffle=False):
+    def build_vllm(self, S, W, next_rope=True, attn="", shuffle=False, fp8=False):
         bnd = self.owner.bnd if self.name == "k5" else 0
-        return _Key(S, W, next_rope, attn, bnd, shuffle)
+        return _Key(S, W, next_rope, attn, bnd, shuffle, fp8)
 
     def build(self, key: _Key):
         o, w = self.owner, key.W
@@ -746,9 +810,20 @@ class _AttnFrag:
 
     @staticmethod
     def vllm_desc(
-        q, kv_cache, block_table, seq_lens, out, part, nreq, scale, shuffled=False
+        q,
+        kv_cache,
+        block_table,
+        seq_lens,
+        out,
+        part,
+        nreq,
+        scale,
+        shuffled=False,
+        k_scale=None,
+        v_scale=None,
     ):
-        k_cache, v_cache, v_plane = kv_launch_args(kv_cache, shuffled)
+        scales = None if k_scale is None else (k_scale, v_scale)
+        k_cache, v_cache, v_plane, ks, vs = kv_launch_args(kv_cache, shuffled, scales)
         return [
             q.data_ptr(),
             k_cache,
@@ -761,6 +836,8 @@ class _AttnFrag:
             nreq,
             0,
             v_plane,
+            ks,
+            vs,
             0,
         ]
 
@@ -860,18 +937,17 @@ class Step:
         return hidden.clone(), [a.clone() for a in aux], kv
 
 
-def _run_mono(
+def _attach(
     tiny: TinyModel,
-    step: Step,
     bnd: int,
     buckets: list[int],
-    mode=CUDAGraphMode.NONE,
     shuffled: bool = False,
-):
-    """The step with the monokernel attached, on the stock launches."""
+    fp8: bool = False,
+) -> StockLaunches:
+    """Attach the monokernel on the stock launches; the caller closes it."""
     from vllm.distributed import get_tp_group
 
-    launches = StockLaunches(tiny.model, tiny.dims, bnd, shuffled)
+    launches = StockLaunches(tiny.model, tiny.dims, bnd, shuffled, fp8)
     tiny.model.mono = MuseSparkMono(
         tiny.model,
         launches.kernels,
@@ -884,12 +960,51 @@ def _run_mono(
             tiny.layers, 4096, _AttnFrag.VLLM_MAX_KEYS
         ),
         shuffled_kv=shuffled,
+        fp8_kv=fp8,
     )
+    return launches
+
+
+def _detach(tiny: TinyModel) -> None:
+    tiny.model.mono.close()
+    tiny.model.mono = None
+
+
+def _run_mono(
+    tiny: TinyModel,
+    step: Step,
+    bnd: int,
+    buckets: list[int],
+    mode=CUDAGraphMode.NONE,
+    shuffled: bool = False,
+):
+    """The step with the monokernel attached, on the stock launches."""
+    launches = _attach(tiny, bnd, buckets, shuffled)
     try:
         return launches, step.run(tiny, mode)
     finally:
-        tiny.model.mono.close()
-        tiny.model.mono = None
+        _detach(tiny)
+
+
+def _step_refusal(tiny: TinyModel, step: Step, caches: dict[str, torch.Tensor]):
+    """The attached monokernel's verdict on the step with ``caches`` bound."""
+    from vllm.forward_context import set_forward_context
+    from vllm.v1.worker.utils import bind_kv_cache
+
+    context = tiny.vllm_config.compilation_config.static_forward_context
+    bind_kv_cache(caches, context, [])
+    slots = dict.fromkeys(step.names, step.common.slot_mapping)
+    with (
+        set_current_vllm_config(tiny.vllm_config),
+        set_forward_context(
+            step.metadata,
+            tiny.vllm_config,
+            num_tokens=step.tokens,
+            slot_mapping=slots,
+        ),
+    ):
+        x = torch.empty(step.tokens, 1, device=step.positions.device)
+        return tiny.model.mono._step_refusal(tiny.model, step.positions, x)
 
 
 def _assert_same_step(stock, mono) -> None:
@@ -953,6 +1068,45 @@ def test_shuffled_cache_selects_the_shuffled_builds(tiny_model, num_reqs) -> Non
     assert kv_keys and all(key.shuffle for key in kv_keys)
     assert any(key.attn for key in kv_keys)
     _assert_same_step(stock, mono)
+
+
+@requires_gfx950
+def test_fp8_cache_selects_the_fp8_builds(tiny_model, monkeypatch) -> None:
+    """A bf16 cache keeps the bf16 builds; the fp8 builds take only an e4m3
+    cache, and only with both k / v scales of every layer. The fp8 steps are
+    checked up to the per-step verdict (the stock pieces write bf16)."""
+    step = Step(tiny_model, [ROWS_PER_REQUEST], seed=1)
+    bf16 = step.kv_caches
+    fp8 = {
+        n: torch.zeros(c.shape, dtype=torch.uint8, device=c.device)
+        for n, c in bf16.items()
+    }
+    e4m3 = {n: c.view(torch.float8_e4m3fn) for n, c in fp8.items()}
+    e5m2 = {n: c.view(torch.float8_e5m2) for n, c in fp8.items()}
+    buckets = [8, 16, 32, 64]
+
+    launches = _attach(tiny_model, 0, buckets)
+    try:
+        keys = [key for name, key in launches.keys if name in ("k3", "k5")]
+        assert keys and not any(key.fp8 for key in keys)
+        assert _step_refusal(tiny_model, step, bf16) is None
+        assert _step_refusal(tiny_model, step, fp8) == "kv:torch.uint8"
+    finally:
+        _detach(tiny_model)
+
+    launches = _attach(tiny_model, 0, buckets, fp8=True)
+    try:
+        keys = [key for name, key in launches.keys if name in ("k3", "k5")]
+        assert keys and all(key.fp8 for key in keys) and any(k.attn for k in keys)
+        assert _step_refusal(tiny_model, step, fp8) is None
+        assert _step_refusal(tiny_model, step, e4m3) is None
+        assert _step_refusal(tiny_model, step, bf16) == "kv:torch.bfloat16"
+        assert _step_refusal(tiny_model, step, e5m2) == "kv:torch.float8_e5m2"
+        attn = tiny_model.layers[FIRST_LAYER + 1].self_attn.attn
+        monkeypatch.setattr(attn, "_v_scale", None)
+        assert _step_refusal(tiny_model, step, fp8) == "kv:scales"
+    finally:
+        _detach(tiny_model)
 
 
 @requires_gfx950
