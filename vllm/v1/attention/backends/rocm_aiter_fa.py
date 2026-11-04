@@ -44,10 +44,10 @@ from vllm.v1.kv_cache_interface import (
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
-# aiter pa_decode_gluon rejects a wider uniform query. The kernel is exact
-# past this; speculative rows (q = 1 + K) fall back to shuffled unified
-# attention until the assert is raised.
-_SHUFFLE_GLUON_MAX_QUERY_LEN = 4
+# pa_decode_gluon is exact through query length 8 (DSpark K=7, q = 1 + K).
+# Wider rows fall back to shuffled unified attention. The installed AITER
+# must allow query_length <= 8, or this call raises.
+_SHUFFLE_GLUON_MAX_QUERY_LEN = 8
 # pa_decode_gluon also asserts query_length * (q heads per KV head) <= 64.
 _SHUFFLE_GLUON_MAX_QUERY_GROUP = 64
 
