@@ -22,7 +22,6 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
 # AITER's fp8 cache is e4m3 only.
 _SHUFFLED_KV_CACHE_DTYPES = frozenset(
@@ -239,23 +238,16 @@ def shuffled_insert_buffers(
 
 
 def _emit_fp8_query(metadata: object, attn_layer: torch.nn.Module) -> bool:
-    """fp8 Q for a decode-only step on a full-attention fp8 shuffled layer.
+    """Keep the fused insert on a bf16 query.
 
-    Sliding-window decode stays on ``pa_decode_gluon`` with a bf16 query.
-    A step that also prefills or extends keeps a bf16 query, because those
-    paths run flash-attn on bf16 K/V. The attention backend quantizes the
-    decode slice itself in that case.
+    Piecewise CUDA graphs of 256 tokens or fewer are captured as one-token
+    decodes and then replayed for a prefill of the same width. Baking an fp8
+    query into that graph makes flash-attention extend reject the step: the
+    query is fp8 and the key is bf16. The attention backend quantizes the
+    single-token full-attention decode rows itself.
     """
-    if metadata is None or not is_quantized_kv_cache(attn_layer.kv_cache_dtype):
-        return False
-    impl = getattr(attn_layer, "impl", None)
-    if impl is None or impl.sliding_window[0] != -1:
-        return False
-    return (
-        getattr(metadata, "num_prefills", 1) == 0
-        and getattr(metadata, "num_extends", 1) == 0
-        and getattr(metadata, "num_decodes", 0) > 0
-    )
+    del metadata, attn_layer
+    return False
 
 
 def shuffled_fused_qk_norm_rope_kv_insert(
