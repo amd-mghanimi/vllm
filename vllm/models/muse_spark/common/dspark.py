@@ -170,6 +170,10 @@ class MuseSparkDSparkModel(DFlashQwen3Model):
                 bias=True,
                 with_markov=config.confidence_head_with_markov,
             )
+        # This class builds Muse layers instead of running DFlashQwen3Model's
+        # constructor. The context-KV projection still has to be initialized
+        # from those layers; load_weights reads it.
+        self._init_context_kv_proj()
 
     def _build_fused_kv_buffers(self) -> None:
         layers_attn = [layer.self_attn for layer in self.layers]
