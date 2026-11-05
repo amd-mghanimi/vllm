@@ -278,6 +278,10 @@ class MuseSparkDSparkModel(DFlashQwen3Model):
                 bias=True,
                 with_markov=config.confidence_head_with_markov,
             )
+        # This class builds Muse layers instead of running DFlashQwen3Model's
+        # constructor. The context-KV projection still has to be initialized
+        # from those layers; load_weights reads it.
+        self._init_context_kv_proj()
         # Under the specialized decode, the draft's fused forward, built once
         # the weights are loaded (process_weights_after_loading).
         self.specialized_decode = specialized
