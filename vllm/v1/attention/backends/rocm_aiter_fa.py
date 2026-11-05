@@ -45,10 +45,13 @@ from vllm.v1.kv_cache_interface import (
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 # pa_decode_gluon is exact through query length 8 (DSpark K=7, q = 1 + K).
-# Wider rows fall back to shuffled unified attention. The installed AITER
-# must allow query_length <= 8, or this call raises.
+# Wider rows fall back to shuffled unified attention. Stock AITER asserts
+# query_length <= 4; ROCm/aiter#7454 raises that to 8:
+# https://github.com/ROCm/aiter/pull/7454
+# Without that change this call raises.
 _SHUFFLE_GLUON_MAX_QUERY_LEN = 8
-# pa_decode_gluon also asserts query_length * (q heads per KV head) <= 64.
+# The kernel flattens query_length * (q heads per KV head) into one MFMA
+# tile and only has layouts through 64.
 _SHUFFLE_GLUON_MAX_QUERY_GROUP = 64
 
 
