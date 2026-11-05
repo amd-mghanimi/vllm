@@ -6,6 +6,7 @@ happen during model execution.
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -52,6 +53,7 @@ from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     from vllm.v1.worker.gpu_worker import Worker
 
@@ -60,6 +62,56 @@ logger = init_logger(__name__)
 _LL_BF16_WARMUP_M_RANGE = range(1, 17)
 
 
+def warmup_rocm_aiter_mm_encoder_fmha(
+    vllm_config: "VllmConfig", device: torch.device
+) -> None:
+    """Compile AITER's gfx950 BF16 Opus FMHA before memory profiling.
+
+    Multimodal encoder profiling is normally the first operation to reach this
+    lazy AITER extension. Compiling it before the initial memory snapshot keeps
+    the one-time compiler/module footprint out of model-profile accounting.
+    """
+    if (
+        not current_platform.is_rocm()
+        or not vllm_config.kernel_config.enable_jit_warmup
+        or vllm_config.model_config.dtype != torch.bfloat16
+        or os.environ.get("AITER_ENABLE_FMHA_OPUS", "0") != "1"
+    ):
+        return
+
+    mm_config = vllm_config.model_config.multimodal_config
+    if mm_config is None:
+        return
+
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    if mm_config.mm_encoder_attn_backend != AttentionBackendEnum.ROCM_AITER_FA:
+        return
+
+    from vllm.platforms.rocm import on_gfx950
+
+    if not on_gfx950():
+        return
+
+    # This is a validated AITER Opus MHA shape and uses the same dense D=128
+    # entry point as ViT attention. The extension is shape-generic after build.
+    from aiter.ops.mha import fmha_fwd_bf16_opus_fwd
+
+    logger.info("Warming up AITER BF16 Opus FMHA for the multimodal encoder.")
+    warmup_start = time.perf_counter()
+    q = torch.empty((1, 256, 16, 128), dtype=torch.bfloat16, device=device)
+    fmha_fwd_bf16_opus_fwd(
+        q,
+        q,
+        q,
+        softmax_scale=128**-0.5,
+        causal=False,
+    )
+    torch.accelerator.synchronize()
+    logger.info(
+        "AITER BF16 Opus FMHA warmup finished in %.2fs.",
+        time.perf_counter() - warmup_start,
+    )
 def _warmup_flashinfer_attention(worker: "Worker") -> None:
     from vllm.distributed.parallel_state import get_pp_group
 
