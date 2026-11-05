@@ -503,6 +503,8 @@ steps:
   - tests/models/transformers/test_layer_registry.py
   - tests/models/test_cohere2_moe_parallel_block.py
   - tests/models/test_kimi_k3_mono_gate.py
+  - tests/models/test_kimi_k3_moe_record.py
+  - vllm/models/kimi_k3/amd/moe_record.py
   device: cpu-small
   commands:
     - >-
@@ -529,6 +531,7 @@ steps:
       models/test_beam_numerics.py
       models/test_cohere2_moe_parallel_block.py
       models/test_kimi_k3_mono_gate.py
+      models/test_kimi_k3_moe_record.py
 
 
 - label: ':amd: (MI355) Kimi-K3 Mono MoE Numerics'
