@@ -8,7 +8,12 @@ import pytest
 
 from vllm.config.cache import CacheConfig
 from vllm.config.scheduler import SchedulerConfig
-from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
+from vllm.config.utils import (
+    get_attr_docs,
+    get_hash_factors,
+    hash_factors,
+    normalize_value,
+)
 
 # Helpers
 
@@ -114,7 +119,7 @@ def test_normalize_value_uuid_and_to_json():
     [
         (lambda x: x),
         (type("CallableInstance", (), {"__call__": lambda self: 0}))(),
-        (lambda: (lambda: 0))(),  # nested function instance
+        (lambda: lambda: 0)(),  # nested function instance
     ],
 )
 def test_error_cases(bad):
@@ -190,6 +195,31 @@ def test_ir_config_hash_initializes_provider_and_tracks_implementation(monkeypat
     assert config.compute_hash() != first_hash
 
 
+def test_get_attr_docs_includes_inherited_fields():
+    """get_attr_docs must collect attribute docstrings inherited from base
+    classes, not just those declared in the class's own body."""
+
+    @dataclass
+    class Base:
+        inherited: object = None
+        """doc for inherited (base)."""
+        overridden: object = None
+        """base version of overridden."""
+
+    @dataclass
+    class Derived(Base):
+        own: object = None
+        """doc for own (derived)."""
+        overridden: object = None
+        """derived override of overridden."""
+
+    docs = get_attr_docs(Derived)
+
+    assert docs["own"] == "doc for own (derived)."
+    assert docs["inherited"] == "doc for inherited (base)."
+    assert docs["overridden"] == "derived override of overridden."
+
+
 def test_envs_compile_factors_stable():
     """Test that envs.compile_factors() hash is stable across fresh initializations.
 
@@ -260,9 +290,27 @@ def test_scheduler_config_hash_includes_max_num_seqs():
     assert larger_batch_hash != base_hash
 
 
+def test_cache_config_default_block_size():
+    config = CacheConfig()
+    assert config.block_size == CacheConfig.DEFAULT_BLOCK_SIZE
+    assert config.user_specified_block_size is False
+    explicit = CacheConfig(block_size=16)
+    assert explicit.block_size == 16
+    assert explicit.user_specified_block_size is True
+
+
 def test_cache_config_hash_ignores_prefix_cache_retention_interval():
     base_hash = CacheConfig().compute_hash()
     assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
+
+
+def test_cache_config_hash_ignores_runtime_offload_sizing():
+    config = CacheConfig()
+    base_hash = config.compute_hash()
+
+    config.simple_cpu_offload_num_blocks = 42
+
+    assert config.compute_hash() == base_hash
 
 
 def test_envs_compile_factors_relocation_invariant(tmp_path):
@@ -325,3 +373,10 @@ print(hash_factors(envs.compile_factors()))
         "HOME relocation changed the compile-cache env hash - a "
         "location-only derived var is leaking into the key"
     )
+
+
+def test_get_attr_docs_rejects_non_class():
+    """The annotation forbids it, but the runtime guard still protects
+    untyped callers, so keep asserting the documented TypeError."""
+    with pytest.raises(TypeError, match="Given object was not a class."):
+        get_attr_docs(object())  # type: ignore[arg-type]
