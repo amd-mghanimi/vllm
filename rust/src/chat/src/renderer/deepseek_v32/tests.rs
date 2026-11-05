@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use thiserror_ext::AsReport;
 
 use super::DeepSeekV32ChatRenderer;
+use crate::EffortValue;
 use crate::error::Error;
 use crate::event::{AssistantContentBlock, AssistantToolCall};
 use crate::renderer::test_utils::{FixtureRequestOptions, fixture_chat_request};
@@ -18,7 +19,7 @@ use crate::request::{
 use crate::{ChatRenderer, ChatRole};
 
 fn render_request(request: &ChatRequest) -> String {
-    DeepSeekV32ChatRenderer::new()
+    DeepSeekV32ChatRenderer::default()
         .render(request)
         .unwrap()
         .prompt
@@ -26,8 +27,30 @@ fn render_request(request: &ChatRequest) -> String {
         .expect("deepseek renderer should return text prompt")
 }
 
+#[test]
+fn effort_enables_binary_thinking_and_none_disables_it() {
+    let mut request = ChatRequest::for_test();
+    for (effort, enabled) in [
+        (EffortValue::from("high"), true),
+        (EffortValue::from("custom"), true),
+        (EffortValue::Number(42.into()), true),
+        (EffortValue::from("none"), false),
+    ] {
+        request.chat_options.reasoning_effort = Some(effort);
+        let rendered = DeepSeekV32ChatRenderer::default().render(&request).unwrap();
+        assert_eq!(
+            rendered.prompt.into_text().unwrap().ends_with("<think>"),
+            enabled
+        );
+        assert_eq!(
+            rendered.effective_template_kwargs["enable_thinking"],
+            enabled
+        );
+    }
+}
+
 fn render_result(request: &ChatRequest) -> Result<String, Error> {
-    DeepSeekV32ChatRenderer::new().render(request).map(|rendered| {
+    DeepSeekV32ChatRenderer::default().render(request).map(|rendered| {
         rendered
             .prompt
             .into_text()
@@ -129,6 +152,7 @@ fn request_level_tools_are_lowered_as_synthetic_leading_system_message() {
             "required": ["query"]
         }),
         strict: None,
+        defer_loading: None,
     }];
     let mut request = ChatRequest {
         request_id: "deepseek-v32-tools".to_string(),
@@ -221,6 +245,37 @@ fn tool_results_after_last_user_resume_thinking() {
         "<｜User｜>Check the weather.<｜Assistant｜><think></think>\n\n<｜DSML｜function_calls>"
     ));
     assert!(rendered.ends_with("</function_results>\n\n<think>"));
+}
+
+#[test]
+fn coerces_tool_call_arguments_that_are_not_an_object_to_empty() {
+    let render_arguments = |arguments: &str| {
+        render_request(&thinking_request(vec![
+            ChatMessage::user("Check the weather."),
+            ChatMessage::assistant_blocks(vec![AssistantContentBlock::ToolCall(
+                AssistantToolCall {
+                    id: "call-weather".to_string(),
+                    name: "weather".to_string(),
+                    arguments: arguments.to_string(),
+                },
+            )]),
+            ChatMessage::tool_response("{\"ok\":true}", "call-weather"),
+        ]))
+    };
+
+    let empty = render_arguments("{}");
+    assert!(empty.contains("<｜DSML｜invoke name=\"weather\">\n\n</｜DSML｜invoke>"));
+    for arguments in [
+        r#"{"city": "Hang"#,
+        "   ",
+        "[]",
+        "42",
+        "true",
+        r#""hello""#,
+        "null",
+    ] {
+        assert_eq!(render_arguments(arguments), empty, "{arguments:?}");
+    }
 }
 
 #[test]
@@ -345,7 +400,7 @@ fn render_rejects_multimodal_input() {
         ..ChatRequest::for_test()
     };
 
-    let error = DeepSeekV32ChatRenderer::new().render(&request).unwrap_err();
+    let error = DeepSeekV32ChatRenderer::default().render(&request).unwrap_err();
 
     assert!(matches!(
         error,
