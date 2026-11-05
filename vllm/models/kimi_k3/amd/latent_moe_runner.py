@@ -7,6 +7,7 @@ import torch
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
@@ -17,12 +18,17 @@ from vllm.models.common.amd.ops.fused_allreduce_rms_norm import (
 
 logger = init_logger(__name__)
 
+# Decode token counts where the latent-AG mailbox replaces the second
+# all-reduce (c4, c16). Prefill and c64 stay on tier 2.
+_LATENT_AG_MAX_TOKENS = 16
+
 
 class ROCmLatentMoERunner(MoERunner):
     """MoE runner for latent MoE with a replicated routed up-projection.
 
-    Mirrors CUDA's LatentMoERunner, but currently only the up projection
-    -sharded path is implemented. (Tier 2)
+    Mirrors CUDA's LatentMoERunner. Tier 2 is the column-parallel up-projection
+    plus a full all-reduce. At ``M <= 16`` the second all-reduce is an
+    all-gather of the 896-column shards via AITER's latent-AG mailbox.
 
     Native path: the replicated up-proj produces the full hidden dim on every
     rank, so the base runner combines routed + shared correctly at any TP size.
@@ -44,18 +50,23 @@ class ROCmLatentMoERunner(MoERunner):
         up_proj = getattr(transform, "up_proj", None)
         tp_size = get_tensor_model_parallel_world_size()
 
+        self._up_proj_preshard = bool(getattr(transform, "row_sharded", False))
         self._up_proj_shard_size = 0
         self._tail_shardable = (
             up_proj is not None
             and tp_size > 1
-            and up_proj.weight.shape[0] % tp_size == 0
+            and (self._up_proj_preshard or up_proj.weight.shape[0] % tp_size == 0)
             and self._shared_experts is not None
             and not self.moe_config.is_sequence_parallel
             and self.routed_scaling_factor == 1.0
         )
         if self._tail_shardable:
             assert up_proj is not None
-            self._up_proj_shard_size = up_proj.weight.shape[0] // tp_size
+            self._up_proj_shard_size = (
+                up_proj.weight.shape[0]
+                if self._up_proj_preshard
+                else up_proj.weight.shape[0] // tp_size
+            )
         else:
             logger.warning_once(
                 "K3 latent-MoE tail is not shardable under this config, "
@@ -63,6 +74,32 @@ class ROCmLatentMoERunner(MoERunner):
                 scope="global",
             )
         self._logged_sharded_tail = False
+        self._logged_mailbox_tail = False
+        self._latent_ag_mailbox = None
+
+    def _latent_ag(self):
+        """One IPC mailbox per runner, allocated before graph capture."""
+        if self._latent_ag_mailbox is not None:
+            return self._latent_ag_mailbox
+        from aiter.ops.latent_ag_mailbox import LatentAgMailbox
+
+        tp = get_tp_group()
+        self._latent_ag_mailbox = LatentAgMailbox(
+            rank=get_tensor_model_parallel_rank(),
+            world_size=get_tensor_model_parallel_world_size(),
+            device=torch.device("cuda", torch.cuda.current_device()),
+            max_m=_LATENT_AG_MAX_TOKENS,
+            shard_n=self._up_proj_shard_size,
+            group=tp.cpu_group,
+        )
+        logger.info_once(
+            "Kimi-K3 latent-MoE tail: mailbox all-gather for M<=%d "
+            "(%d bytes/rank).",
+            _LATENT_AG_MAX_TOKENS,
+            self._latent_ag_mailbox.mailbox_bytes,
+            scope="global",
+        )
+        return self._latent_ag_mailbox
 
     def _shard_up_proj_tail(
         self,
@@ -89,12 +126,35 @@ class ROCmLatentMoERunner(MoERunner):
 
         shard_size = self._up_proj_shard_size
         shard_start = get_tensor_model_parallel_rank() * shard_size
-        up_proj_shard = transform.up_proj.weight.narrow(0, shard_start, shard_size)
+        weight = transform.up_proj.weight
+        up_proj_shard = (
+            weight
+            if self._up_proj_preshard
+            else weight.narrow(0, shard_start, shard_size)
+        )
         hidden_shard = shared_output.narrow(-1, shard_start, shard_size)
 
         # hidden_shard += latent @ up_proj_shard.T, accumulated in the GEMM's
         # beta-add epilogue so folding in the shared partial costs no kernel.
         hidden_shard.addmm_(latent, up_proj_shard.t())
+
+        num_tokens = fused_output.shape[0]
+        if 0 < num_tokens <= _LATENT_AG_MAX_TOKENS:
+            if not self._logged_mailbox_tail:
+                self._logged_mailbox_tail = True
+                logger.info_once(
+                    "Kimi-K3 latent-MoE tail: all-gathering the up-proj shard "
+                    "via the latent-AG mailbox (M<=%d).",
+                    _LATENT_AG_MAX_TOKENS,
+                    scope="global",
+                )
+            out = self._latent_ag().allgather(hidden_shard.contiguous())
+            # Already the full hidden. Strip padding here; the late all-reduce
+            # would slice the wrong axis of a fresh [M, hidden] tensor only if
+            # trunc_size were a routed dim, which it is not for this tail.
+            if trunc_size is not None:
+                out = out[..., :trunc_size]
+            return out
 
         return self._maybe_reduce_final_output(
             shared_output, trunc_size, output_is_reduced=False
