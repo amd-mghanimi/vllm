@@ -64,7 +64,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64
 
-from .attn_frag import store_kv_shuffled
+from .attn_frag import store_kv_fp8, store_kv_shuffled
 from .dev import (
     BLOCKS,
     CM_DEV,
@@ -162,6 +162,9 @@ class Build:
     # this layer's verify attention fused at the HA head ("swa" / "full")
     attn: str = ""
     shuffle: bool = False  # AITER's shuffled KV cache (attn_frag.kv_planes)
+    fp8: bool = (
+        False  # e4m3 KV cache with per-tensor k / v scales (attn_frag.store_kv_fp8)
+    )
 
     @property
     def bnd(self):
@@ -298,7 +301,7 @@ def build(key: Build):
         from . import attn_frag
 
         assert key.attn in ("swa", "full"), key
-        FA = attn_frag.make(S // 8, key.attn == "swa", shuffle=key.shuffle)
+        FA = attn_frag.make(S // 8, key.attn == "swa", shuffle=key.shuffle, fp8=key.fp8)
         FaLds = FA.Lds
         # the fragment's source hash: the disk cache does not follow FA.run
         _KEYSTR = _KEYSTR + FA.key
@@ -333,7 +336,7 @@ def build(key: Build):
         pr: fx.Array[fx.Float32, 512 + 64 if BND else 8, 16]
         red4: fx.Array[fx.Float32, 32, 16]
 
-    shuf = "_shuf" if key.shuffle else ""
+    shuf = ("_shuf" if key.shuffle else "") + ("_fp8" if key.fp8 else "")
     name_a = f"muse_k5a_s{S}" + (f"_fa{key.attn}" if key.attn else "") + shuf
     name_b = f"muse_k5b_s{S}_r{int(key.next_rope)}" + shuf
 
@@ -1836,6 +1839,8 @@ def build(key: Build):
         k_cache,
         v_cache,
         v_plane,
+        k_scale,
+        v_scale,
         slots,
         cos_sin,
         pos,
@@ -1854,7 +1859,8 @@ def build(key: Build):
         value); each half wave stores with its own wave-uniform 64-bit block base (readlane of its slot);
         slot < 0 and tt >= nrows skipped. Rows tt >= nrows are not real rows (their q is written, their KV
         is not). key.shuffle: the shuffled K / V planes at k_cache / v_plane, both with block stride
-        v_cache (attn_frag.store_kv_shuffled)."""
+        v_cache (attn_frag.store_kv_shuffled). key.fp8: the same placement in e4m3 bytes, quantized
+        with the fp32 [1] k_scale / v_scale (attn_frag.store_kv_fp8)."""
         row0 = (hh * HD) // 2 + p
         got = mb_poll(
             tag,
@@ -1890,7 +1896,22 @@ def build(key: Build):
                 tl_ = readlane(tt, 32 * half)
                 mine = ((tid % 64) >= 32) if half == 1 else ((tid % 64) < 32)
                 if (sl >= 0) & (tl_ < nrows):
-                    if const_expr(key.shuffle):
+                    if const_expr(key.fp8):
+                        blk = fx.Int64(sl >> 4) * v_cache
+                        if mine:
+                            store_kv_fp8(
+                                bf16_pair(o0, o1),
+                                isv,
+                                kv,
+                                sl & 15,
+                                p,
+                                k_cache + blk,
+                                v_plane + blk,
+                                k_scale,
+                                v_scale,
+                                key.shuffle,
+                            )
+                    if const_expr(key.shuffle and not key.fp8):
                         blk = fx.Int64(sl >> 4) * v_cache * fx.Int64(2)
                         if mine:
                             store_kv_shuffled(
@@ -1902,7 +1923,7 @@ def build(key: Build):
                                 k_cache + blk,
                                 v_plane + blk,
                             )
-                    else:
+                    if const_expr(not key.shuffle and not key.fp8):
                         base = k_cache + (
                             fx.Int64(sl >> 4) * v_cache
                             + fx.Int64(
@@ -1920,6 +1941,8 @@ def build(key: Build):
         k_cache,
         v_cache,
         v_plane,
+        k_scale,
+        v_scale,
         slots,
         cos_sin,
         pos,
@@ -1942,6 +1965,8 @@ def build(key: Build):
                     k_cache,
                     v_cache,
                     v_plane,
+                    k_scale,
+                    v_scale,
                     slots,
                     cos_sin,
                     pos,
@@ -2134,6 +2159,8 @@ def build(key: Build):
         k_cache: Int64,
         v_cache: Int64,
         v_plane: Int64,
+        k_scale: Int64,
+        v_scale: Int64,
         slots: Int64,
         cos_sin: Int64,
         pos: Int64,
@@ -2240,6 +2267,8 @@ def build(key: Build):
             k_cache,
             v_cache,
             v_plane,
+            k_scale,
+            v_scale,
             slots,
             cos_sin,
             pos,
@@ -2339,6 +2368,8 @@ def build(key: Build):
         k_cache: Int64,
         v_cache: Int64,
         v_plane: Int64,
+        k_scale: Int64,
+        v_scale: Int64,
         slots: Int64,
         cos_sin: Int64,
         pos: Int64,
@@ -2378,6 +2409,8 @@ def build(key: Build):
             k_cache,
             v_cache,
             v_plane,
+            k_scale,
+            v_scale,
             slots,
             cos_sin,
             pos,
@@ -2405,9 +2438,16 @@ def build(key: Build):
     return _BUILDS[key]
 
 
-def build_vllm(S=32, W=8, next_rope=True, attn="", shuffle=False):
+def build_vllm(S=32, W=8, next_rope=True, attn="", shuffle=False, fp8=False):
     """The HA / HB build vLLM launches for S rows (32 / 64 / 96 / 128) of a TP = EP = 8 group;
     next_rope: the next layer has RoPE (HB); attn = "swa" / "full": this layer's verify attention
-    fused at the HA head; shuffle: AITER's shuffled KV cache (HA's fragment, HB's KV store)."""
+    fused at the HA head; shuffle: AITER's shuffled KV cache (HA's fragment, HB's KV store); fp8:
+    an e4m3 KV cache."""
     assert W == 8 and S in (32, 64, 96, 128), (S, W)
-    return Build(S=S, next_rope=bool(next_rope), attn=attn, shuffle=bool(shuffle))
+    return Build(
+        S=S,
+        next_rope=bool(next_rope),
+        attn=attn,
+        shuffle=bool(shuffle),
+        fp8=bool(fp8),
+    )

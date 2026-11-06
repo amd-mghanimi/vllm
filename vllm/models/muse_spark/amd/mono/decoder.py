@@ -44,6 +44,10 @@ HEALTH_POLL_INTERVAL = 64
 # Other builds and layer 1 run vLLM's attention op.
 FUSED_ATTENTION = {8: ("swa", "full"), 16: ("swa", "full"), 32: ("swa", "full")}
 SLIDING_WINDOW = (2047, 0)
+# kv_cache_dtype values the fp8 builds serve (OCP e4m3, per-tensor k / v scales)
+# and the cache storage dtypes vLLM allocates for them.
+FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+FP8_KV_STORAGE = (torch.uint8, torch.float8_e4m3fn)
 
 # The model shape the K3 build is specialized for.
 KERNEL_CONFIG: dict[str, float] = {
@@ -240,7 +244,9 @@ def deployment_refusals(
 
     ``shuffled_kv`` (the ROCm shuffle KV cache layout) is supported: the
     builds then read and write the shuffled planes, and every step checks the
-    cache view against that layout (``kv_cache_refusal``).
+    cache view against that layout (``kv_cache_refusal``). So is an e4m3 KV
+    cache (``FP8_KV_CACHE_DTYPES``): the fp8 builds quantize on the store and
+    dequantize on the load, with the attention layers' k / v scales.
     """
     del shuffled_kv
     reasons = []
@@ -284,8 +290,8 @@ def deployment_refusals(
     cache = vllm_config.cache_config
     if getattr(cache, "kv_offloading_size", None):
         reasons.append("KV offloading on")
-    if cache.cache_dtype not in ("auto", "bfloat16"):
-        reasons.append(f"kv_cache_dtype={cache.cache_dtype} (kernel: bf16)")
+    if cache.cache_dtype not in ("auto", "bfloat16", *FP8_KV_CACHE_DTYPES):
+        reasons.append(f"kv_cache_dtype={cache.cache_dtype} (kernel: bf16, fp8_e4m3)")
     if vllm_config.model_config.dtype != torch.bfloat16:
         reasons.append(f"model dtype {vllm_config.model_config.dtype}")
     return reasons
@@ -384,7 +390,7 @@ def layer_refusals(model: nn.Module, dims: MonoDims) -> list[str]:
 
 
 def kv_cache_refusal(
-    kv_cache: torch.Tensor, kv_heads: int, shuffled: bool = False
+    kv_cache: torch.Tensor, kv_heads: int, shuffled: bool = False, fp8: bool = False
 ) -> str | None:
     """K3 writes bf16 LBHNC pages: ``[block][kv head][16 tokens][K | V]``, or,
     under the AITER shuffle layout (``shuffled``), vLLM's two head slots
@@ -393,10 +399,12 @@ def kv_cache_refusal(
 
     The layout comes from ``shuffled``, not from the view: under LBHNC the
     shuffled view has the dense shape and strides when there are 2 kv heads.
+    The fp8 builds (``fp8``) take the same element shape and strides in
+    ``FP8_KV_STORAGE``; the bf16 builds take bf16 only.
     """
     if kv_cache.numel() == 0:
         return "kv:unbound"
-    if kv_cache.dtype != torch.bfloat16:
+    if kv_cache.dtype not in (FP8_KV_STORAGE if fp8 else (torch.bfloat16,)):
         return f"kv:{kv_cache.dtype}"
     if shuffled:
         content = kv_heads * 64
@@ -414,13 +422,39 @@ def kv_cache_refusal(
     return None
 
 
-def kv_launch_args(kv_cache: torch.Tensor, shuffled: bool) -> tuple[int, int, int]:
-    """The launches' ``(k_cache, v_cache, v_plane)``: the K base, the block
-    stride in elements (a value, in the V slot) and the V plane base (shuffled:
-    head slot 1; dense: unused, the K base)."""
+def kv_scales(
+    attn_layer: nn.Module, kv_cache: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The layer's fp32 ``[1]`` k / v scales on the cache's device (the
+    tensors the fused KV insert quantizes with); None if either is missing."""
+    scales = (
+        getattr(attn_layer, "_k_scale", None),
+        getattr(attn_layer, "_v_scale", None),
+    )
+    for t in scales:
+        if (
+            not isinstance(t, torch.Tensor)
+            or t.dtype != torch.float32
+            or t.numel() != 1
+            or t.device != kv_cache.device
+        ):
+            return None
+    return scales
+
+
+def kv_launch_args(
+    kv_cache: torch.Tensor,
+    shuffled: bool,
+    scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[int, int, int, int, int]:
+    """The launches' ``(k_cache, v_cache, v_plane, k_scale, v_scale)``: the K
+    base, the block stride in elements (a value, in the V slot), the V plane
+    base (shuffled: head slot 1; dense: unused, the K base) and the fp8
+    builds' scale pointers (``scales``; 0 for the bf16 builds)."""
     k = kv_cache.data_ptr()
     v = k + kv_cache.stride(1) * kv_cache.element_size() if shuffled else k
-    return k, kv_cache.stride(0), v
+    ks, vs = (t.data_ptr() for t in scales) if scales is not None else (0, 0)
+    return k, kv_cache.stride(0), v, ks, vs
 
 
 def attention_type(layer: nn.Module) -> str | None:
@@ -506,9 +540,9 @@ class _FusedAttention:
     tables (``kernels/attn_frag.py``; row i = layer i).
 
     A table holds pointers and counts only (q, KV cache, block table,
-    seq_lens, output, request count, scale). Tables are keyed by their
-    contents, so one is written once and never changes after a CUDA graph
-    captured a launch that reads it.
+    seq_lens, output, request count, scale, fp8 k / v scale pointers). Tables
+    are keyed by their contents, so one is written once and never changes
+    after a CUDA graph captured a launch that reads it.
     """
 
     def __init__(
@@ -520,11 +554,13 @@ class _FusedAttention:
         dims: MonoDims,
         device: torch.device,
         shuffled_kv: bool = False,
+        fp8_kv: bool = False,
     ) -> None:
         self.af = attn_frag
         self.layers = layers
         self.scales = scales
         self.shuffled_kv = shuffled_kv
+        self.fp8_kv = fp8_kv
         self.out = torch.zeros(rows, dims.q_rows, dtype=torch.bfloat16, device=device)
         self.part = torch.zeros(
             attn_frag.part_bytes() // 4, dtype=torch.int32, device=device
@@ -546,9 +582,10 @@ class _FusedAttention:
         """The descriptor table of this step; ``q_of(i)`` = layer i's q."""
         rows = {}
         for i in self.layers:
-            md, _, kv_cache, _ = get_attention_context(
+            md, attn_layer, kv_cache, _ = get_attention_context(
                 layers[i].self_attn.attn.layer_name
             )
+            kv_scale = kv_scales(attn_layer, kv_cache) if self.fp8_kv else None
             rows[i] = self.af.vllm_desc(
                 q_of(i),
                 kv_cache,
@@ -559,6 +596,8 @@ class _FusedAttention:
                 num_reqs,
                 self.scales[i],
                 shuffled=self.shuffled_kv,
+                k_scale=kv_scale[0] if kv_scale else None,
+                v_scale=kv_scale[1] if kv_scale else None,
             )
         key = tuple((i, *w) for i, w in rows.items())
         table = self.tables.get(key)
@@ -635,11 +674,12 @@ class _Bucket:
                     o = layers[i].self_attn.attn(q, None, None)
                 attn_o = o.data_ptr()
             nxt = layers[i + 1].self_attn
-            _, _, kv_cache, slots = get_attention_context(nxt.attn.layer_name)
+            _, attn_layer, kv_cache, slots = get_attention_context(nxt.attn.layer_name)
             rope = nxt.rotary_emb
             cos_sin = rope.cos_sin_cache if rope is not None else self.no_rope
             ptrs = (slots.data_ptr(), cos_sin.data_ptr(), positions.data_ptr())
-            kv = (*kv_launch_args(kv_cache, mono.shuffled_kv), *ptrs)
+            scales = kv_scales(attn_layer, kv_cache) if mono.fp8_kv else None
+            kv = (*kv_launch_args(kv_cache, mono.shuffled_kv, scales), *ptrs)
             stream, q, g = self.layer(mono, i, kind, attn_o, g, stream, kv, aux_layers)
             if i + 1 in aux_layers:
                 aux_hidden_states.append(stream.clone())
@@ -663,21 +703,19 @@ class _K3Bucket(_Bucket):
         fa: _FusedAttention | None = None,
         fused_kinds: Sequence[tuple[bool, str]] = (),
         shuffled_kv: bool = False,
+        fp8_kv: bool = False,
     ) -> None:
         w = dims.world_size
         super().__init__(k3, k3.peer_layout(rows, w)[1], dims, device, group)
+        kv = {"shuffle": shuffled_kv, "fp8": fp8_kv}
         self.launchers = {
-            next_rope: k3.build(
-                k3.build_vllm(S=rows, W=w, next_rope=next_rope, shuffle=shuffled_kv)
-            )
+            next_rope: k3.build(k3.build_vllm(S=rows, W=w, next_rope=next_rope, **kv))
             for next_rope in (True, False)
         }
         self.fa = fa
         self.fused_launchers = {
             (next_rope, kind): k3.build(
-                k3.build_vllm(
-                    S=rows, W=w, next_rope=next_rope, attn=kind, shuffle=shuffled_kv
-                )
+                k3.build_vllm(S=rows, W=w, next_rope=next_rope, attn=kind, **kv)
             )
             for next_rope, kind in fused_kinds
         }
@@ -747,9 +785,12 @@ class _K5Bucket(_Bucket):
         fa: _FusedAttention | None = None,
         fused_kinds: Sequence[str] = (),
         shuffled_kv: bool = False,
+        fp8_kv: bool = False,
     ) -> None:
         w = dims.world_size
-        key = k5.build_vllm(S=rows, W=w, next_rope=True, shuffle=shuffled_kv)
+        key = k5.build_vllm(
+            S=rows, W=w, next_rope=True, shuffle=shuffled_kv, fp8=fp8_kv
+        )
         super().__init__(k5, k5.peer_layout(rows, w, key.bnd)[1], dims, device, group)
         self.bnd = key.bnd
         self.launch_a, launch_b = k5.build(key)
@@ -878,10 +919,14 @@ class MuseSparkMono:
         buckets: Sequence[int],
         fused_attention: dict[int, str],
         shuffled_kv: bool = False,
+        fp8_kv: bool = False,
     ) -> None:
         self.rank = rank
         self.dims = dims
         self.shuffled_kv = shuffled_kv
+        # An e4m3 cache (FP8_KV_CACHE_DTYPES): every build is the fp8 one and
+        # every step checks for an fp8 cache and its k / v scales.
+        self.fp8_kv = fp8_kv
         self.refresh_weights(model)
         self.buckets: dict[int, _Bucket] = {}
         for b in buckets:
@@ -893,14 +938,29 @@ class MuseSparkMono:
                     i: float(model.layers[i].self_attn.attn.impl.scale) for i in layers
                 }
                 fa = _FusedAttention(
-                    kernels.attn_frag, layers, scales, b, dims, device, shuffled_kv
+                    kernels.attn_frag,
+                    layers,
+                    scales,
+                    b,
+                    dims,
+                    device,
+                    shuffled_kv,
+                    fp8_kv,
                 )
             if b in K3_ROWS:
                 k3_kinds = sorted(
                     {(self.weights[i].next_rope, t) for i, t in layers.items()}
                 )
                 self.buckets[b] = _K3Bucket(
-                    kernels.k3, b, dims, device, group, fa, k3_kinds, shuffled_kv
+                    kernels.k3,
+                    b,
+                    dims,
+                    device,
+                    group,
+                    fa,
+                    k3_kinds,
+                    shuffled_kv,
+                    fp8_kv,
                 )
             else:
                 self.buckets[b] = _K5Bucket(
@@ -913,6 +973,7 @@ class MuseSparkMono:
                     fa,
                     sorted(set(layers.values())),
                     shuffled_kv,
+                    fp8_kv,
                 )
         self._validated: set[int] = set()
         self._fallbacks: set[str] = set()
@@ -949,12 +1010,14 @@ class MuseSparkMono:
         if positions.dtype != torch.int64 or positions.shape != (rows,):
             return "positions"
         for name in names[1:]:
-            _, _, kv_cache, slots = get_attention_context(name)
+            _, attn_layer, kv_cache, slots = get_attention_context(name)
             reason = kv_cache_refusal(
-                kv_cache, self.dims.local_kv_heads, self.shuffled_kv
+                kv_cache, self.dims.local_kv_heads, self.shuffled_kv, self.fp8_kv
             )
             if reason is not None:
                 return reason
+            if self.fp8_kv and kv_scales(attn_layer, kv_cache) is None:
+                return "kv:scales"
             if (
                 slots is None
                 or slots.dtype != torch.int64

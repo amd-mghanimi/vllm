@@ -14,8 +14,9 @@ cover run vLLM's stock path.
   `--enable-expert-parallel` (linear placement, 32 experts a rank, no EPLB),
   no PP / DP / DCP / PCP, Quark OCP-MXFP4 W4A4 experts on `AITER_MXFP4_MXFP4`
   (shuffled weights and scales), the fused QK-norm / RoPE / KV insert,
-  `ROCM_AITER_FA` with a bf16 KV cache in the LBHNC layout (block size 16),
-  DSpark with 7 draft tokens, no LoRA, sleep mode or weight transfer, no KV
+  `ROCM_AITER_FA` with a bf16 or e4m3 (`--kv-cache-dtype fp8` / `fp8_e4m3`,
+  per-tensor k / v scales) KV cache, dense LBHNC or the AITER shuffle layout
+  (block size 16), DSpark with 7 draft tokens, no LoRA, sleep mode or weight transfer, no KV
   connector or offloading.
 - Steps (checked every forward; anything else runs stock): uniform decode
   verify batches of 1-16 requests x 8 tokens, FULL CUDA graph or eager.
@@ -40,7 +41,7 @@ Fused attention: at 8, 16 and 24-32 rows every layer from layer 2 runs its
 verify attention at the head of K3_i / HA_i (`kernels/attn_frag.py`) instead
 of vLLM's op: split over all 256 CTAs by
 (request, kv head, key range), then merged before o_proj. It reads layer i's
-q from the previous launch, layer i's bf16 KV cache through its KV cache
+q from the previous launch, layer i's KV cache through its KV cache
 group's `block_table` (int32) and `seq_lens` (int32), the softmax scale of the
 layer's attention impl, and for sliding-window layers vLLM's window (2047, 0)
 (only blocks inside the window are read). The builds stage block ids for up
@@ -57,10 +58,14 @@ op. 40-128 rows keep vLLM's op.
   norm multipliers are small bf16 copies (`weight + gain_center`).
 - KV: layer i+1's `kv_cache` `[block][kv head][16 tokens][K 64 | V 64]` bf16
   and its group's `slot_mapping` (`slot < 0` = graph padding, skipped); the
-  block stride is a launch argument.
-- Fused attention: one descriptor table a build and step shape (10 words a
+  block stride is a launch argument. An fp8 cache has the same element layout
+  in e4m3 bytes (shuffled: x = 16); K / V are quantized after the bf16
+  rounding with `1 / layer._k_scale` / `1 / layer._v_scale` (the fused insert's
+  scales, read through their pointers) and dequantized to bf16 on the load.
+  A step without those scales runs stock.
+- Fused attention: one descriptor table a build and step shape (14 words a
   layer: q, KV cache and block stride, block table and row stride, seq_lens,
-  output, scratch, request count, scale). Tables are keyed by their contents
+  output, scratch, request count, scale, V plane, k / v scale pointers). Tables are keyed by their contents
   and written once (a pinned-buffer copy when first seen during graph capture).
 - q leaves without the QK scale: vLLM's attention applies
   `0.125 * qk_scale_factor` as its softmax scale.
@@ -80,3 +85,5 @@ activations). The stock W4A4 path quantizes the expert inputs and the SwiGLU
 output to MXFP4, so `--monokernel` outputs differ from the stock path (and
 prefill, which runs stock, uses W4A4). Other differences are reduction order
 (router, GEMVs, all-reduces in rank order) and the bf16 norm multipliers.
+With an fp8 KV cache the attention math stays bf16 (bf16 q, dequantized bf16
+K / V, bf16 MFMAs); q is not quantized.
