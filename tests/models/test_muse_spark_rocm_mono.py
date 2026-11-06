@@ -47,6 +47,7 @@ from vllm.models.muse_spark.amd.mono.decoder import (
     deployment_refusals,
     fused_attention_layers,
     kv_cache_refusal,
+    kv_launch_args,
     layer_refusals,
 )
 from vllm.platforms import current_platform
@@ -284,6 +285,56 @@ def test_kv_cache_guard_accepts_only_dense_bf16_lbhnc() -> None:
     assert kv_cache_refusal(torch.empty(0, dtype=torch.bfloat16), 2) == "kv:unbound"
 
 
+def _shuffled_cache_view(layout) -> torch.Tensor:
+    """A TP8 rank's layer view as the allocator builds it for the AITER
+    shuffle layout: K and V as two head slots of ``heads x 64`` (customize_spec)."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheTensor,
+        compute_layout_strides,
+        create_kv_cache_views,
+    )
+
+    dense = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+    )
+    spec = dataclasses.replace(dense, num_head_slots=2, state_content_bytes=2 * 64 * 2)
+    num_blocks = 10
+    layer_stride, block_stride, *_ = compute_layout_strides(spec, num_blocks, 1, layout)
+    size = num_blocks * spec.page_size_bytes
+    tensor = KVCacheTensor(
+        size=size, layers=["l"], layer_stride=layer_stride, block_stride=block_stride
+    )
+    raw = torch.empty(size, dtype=torch.int8, device="meta")
+    return create_kv_cache_views(raw, spec, num_blocks, layout, tensor)[0]
+
+
+@pytest.mark.parametrize("layout", ["LHBNC", "LBHNC"])
+def test_kv_cache_guard_follows_the_shuffle_layout(layout) -> None:
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    view = _shuffled_cache_view(KVCacheLayout[layout])
+    assert kv_cache_refusal(view, 2, shuffled=True) is None
+    assert kv_launch_args(view, shuffled=True) == (
+        view.data_ptr(),
+        view.stride(0),
+        view.data_ptr() + view.stride(1) * view.element_size(),
+    )
+    if layout == "LBHNC":
+        # The K / V slot dim stands where the 2 kv heads of a dense page are:
+        # only the layout flag tells the two apart.
+        dense = torch.empty(10, 2, 16, 128, dtype=torch.bfloat16, device="meta")
+        assert (view.shape, view.stride()) == (dense.shape, dense.stride())
+    else:
+        assert kv_cache_refusal(view, 2).startswith("kv:stride")
+    block32 = torch.empty(10, 2, 32, 128, dtype=torch.bfloat16, device="meta")
+    assert kv_cache_refusal(block32, 2, shuffled=True).startswith("kv:shuffled-shape")
+    overlap = torch.empty(10, 2, 16, 128, dtype=torch.bfloat16, device="meta")
+    assert kv_cache_refusal(
+        overlap.as_strided(overlap.shape, (2048, 64, 128, 1)), 2, shuffled=True
+    ).startswith("kv:shuffled-stride")
+
+
 def test_config_guard_accepts_only_the_checkpoint_shape() -> None:
     assert config_refusals(MuseSparkTextConfig(**CHECKPOINT_TEXT)) == []
     assert config_refusals(MuseSparkTextConfig(**TINY_TEXT)) == [
@@ -338,6 +389,9 @@ def test_deployment_guard_accepts_only_tep8_with_dspark(checkpoints) -> None:
         "weight transfer on",
         "kv_cache_dtype=fp8 (kernel: bf16)",
     ]
+
+    # The builds read and write the shuffled planes (Build.shuffle).
+    assert deployment_refusals(tep8, 3, 8, _moe_parallel(), shuffled_kv=True) == []
 
 
 # ------------------------------------------------- the tiny model on one GPU
@@ -507,7 +561,8 @@ def test_fused_attention_layers_follow_the_window(tiny_model) -> None:
 _K3_HEAD = (
     "attn_o attn_g stream_pre w_o alpha_a beta_a w_pffn w_r bias w_pre w_pren "
     "w13 w13s w2 w2s w_post w_pp w_pff alpha beta w_in w_qkvg stream_out xn_out "
-    "part_out q_out g_out k_cache v_cache slots cos_sin pos scratch epoch health tl"
+    "part_out q_out g_out k_cache v_cache v_plane slots cos_sin pos scratch epoch "
+    "health tl"
 )
 _HA_HEAD = (
     "attn_o attn_g stream_in w_o alpha_a beta_a w_pffn w_r bias w_pre w_pren "
@@ -516,10 +571,10 @@ _HA_HEAD = (
 _HM_HEAD = "h ids sc w13 w13s w2 w2s w_post part_out scratch epoch health tl"
 _HB_HEAD = (
     "part w_pp w_pff alpha beta w_in w_qkvg stream_out sfull_out q_out g_out "
-    "k_cache v_cache slots cos_sin pos scratch epoch health tl"
+    "k_cache v_cache v_plane slots cos_sin pos scratch epoch health tl"
 )
 _REPLICAS = " w13r w13sr w2r w2sr eptab"
-_DESC_WORDS = 10
+_DESC_WORDS = 12
 
 
 def _params(head: str, world_size: int, tail: str) -> list[str]:
@@ -549,10 +604,12 @@ class StockLaunches:
     """The FlyDSL monokernel sources, with each launch running the stock layer
     pieces it replaces on the memory at its arguments' pointers."""
 
-    def __init__(self, model, dims: MonoDims, bnd: int) -> None:
+    def __init__(self, model, dims: MonoDims, bnd: int, shuffled: bool = False) -> None:
         self.model, self.dims, self.bnd = model, dims, bnd
+        self.shuffled = shuffled
         self.calls: list[tuple[str, dict]] = []
         self.pending: dict[int, dict] = {}
+        self.keys: set[tuple[str, Any]] = set()
         self.kernels = MonoKernels(
             *(_Kernel(self, name) for name in ("k3", "k5", "k5m")), _AttnFrag()
         )
@@ -581,13 +638,15 @@ class StockLaunches:
             return _device_view(attn_o, (rows, d.q_rows), torch.bfloat16)
         words = _device_view(attn_o, (_DESC_WORDS,), torch.int64).tolist()
         md, _, kv_cache, _ = _attention_context(layer)
+        k_cache, v_cache, v_plane = kv_launch_args(kv_cache, self.shuffled)
         assert words[1:5] == [
-            kv_cache.data_ptr(),
-            kv_cache.stride(0),
+            k_cache,
+            v_cache,
             md.block_table.data_ptr(),
             md.seq_lens.data_ptr(),
         ]
         assert words[8] == nreq
+        assert words[10] == v_plane
         q = _device_view(words[0], (rows, d.q_rows), torch.bfloat16)
         out = _device_view(words[5], (rows, d.q_rows), torch.bfloat16)
         out.copy_(layer.self_attn.attn(q, None, None))
@@ -605,8 +664,9 @@ class StockLaunches:
         stream = _device_view(a["stream"], (rows, d.hidden_size), torch.float32)
         positions = _device_view(b["pos"], (rows,), torch.int64)
         _, _, kv_cache, slots = _attention_context(nxt)
-        assert b["k_cache"] == kv_cache.data_ptr()
-        assert b["v_cache"] == kv_cache.stride(0)
+        assert (b["k_cache"], b["v_cache"], b["v_plane"]) == kv_launch_args(
+            kv_cache, self.shuffled
+        )
         assert b["slots"] == slots.data_ptr()
         rope = nxt.self_attn.rotary_emb
         if rope is not None:
@@ -631,6 +691,7 @@ class _Key:
     next_rope: bool = True
     attn: str = ""
     bnd: int = 0
+    shuffle: bool = False
 
 
 class _Kernel:
@@ -649,11 +710,13 @@ class _Kernel:
     def scratch_layout(self, S, W=1, bnd=0):
         return {}, 4096
 
-    def build_vllm(self, S, W, next_rope=True, attn=""):
-        return _Key(S, W, next_rope, attn, self.owner.bnd if self.name == "k5" else 0)
+    def build_vllm(self, S, W, next_rope=True, attn="", shuffle=False):
+        bnd = self.owner.bnd if self.name == "k5" else 0
+        return _Key(S, W, next_rope, attn, bnd, shuffle)
 
     def build(self, key: _Key):
         o, w = self.owner, key.W
+        o.keys.add((self.name, key))
         if self.name == "k3":
             params = _params(_K3_HEAD, w, "layer rank g_stride" + _REPLICAS)
             return o.launcher("k3", params, lambda a: _run_k3(o, key, a))
@@ -682,17 +745,22 @@ class _AttnFrag:
         return 4096
 
     @staticmethod
-    def vllm_desc(q, kv_cache, block_table, seq_lens, out, part, nreq, scale):
+    def vllm_desc(
+        q, kv_cache, block_table, seq_lens, out, part, nreq, scale, shuffled=False
+    ):
+        k_cache, v_cache, v_plane = kv_launch_args(kv_cache, shuffled)
         return [
             q.data_ptr(),
-            kv_cache.data_ptr(),
-            kv_cache.stride(0),
+            k_cache,
+            v_cache,
             block_table.data_ptr(),
             seq_lens.data_ptr(),
             out.data_ptr(),
             part.data_ptr(),
             block_table.stride(0),
             nreq,
+            0,
+            v_plane,
             0,
         ]
 
@@ -793,12 +861,17 @@ class Step:
 
 
 def _run_mono(
-    tiny: TinyModel, step: Step, bnd: int, buckets: list[int], mode=CUDAGraphMode.NONE
+    tiny: TinyModel,
+    step: Step,
+    bnd: int,
+    buckets: list[int],
+    mode=CUDAGraphMode.NONE,
+    shuffled: bool = False,
 ):
     """The step with the monokernel attached, on the stock launches."""
     from vllm.distributed import get_tp_group
 
-    launches = StockLaunches(tiny.model, tiny.dims, bnd)
+    launches = StockLaunches(tiny.model, tiny.dims, bnd, shuffled)
     tiny.model.mono = MuseSparkMono(
         tiny.model,
         launches.kernels,
@@ -810,6 +883,7 @@ def _run_mono(
         fused_attention=fused_attention_layers(
             tiny.layers, 4096, _AttnFrag.VLLM_MAX_KEYS
         ),
+        shuffled_kv=shuffled,
     )
     try:
         return launches, step.run(tiny, mode)
@@ -860,6 +934,24 @@ def test_mono_step_matches_the_stock_loop(
     assert [a["layer"] for name, a in launches.calls if name in ("k3", "hb")] == list(
         range(FIRST_LAYER, LAST_LAYER + 1)
     )
+    _assert_same_step(stock, mono)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("num_reqs", [1, 3, 5])
+def test_shuffled_cache_selects_the_shuffled_builds(tiny_model, num_reqs) -> None:
+    """With the shuffle layout on, every K3 / HA / HB build is the shuffled
+    one, and the launches and fused-attention descriptors carry the V plane
+    (head slot 1). The stock pieces still run on the step's dense cache: this
+    checks the wiring, not the shuffled kernels."""
+    tiny_model.lm.set_aux_hidden_state_layers((14, 30, 46, 58, 62))
+    step = Step(tiny_model, [ROWS_PER_REQUEST] * num_reqs, seed=num_reqs)
+    stock = step.run(tiny_model)
+    launches, mono = _run_mono(tiny_model, step, 0, [8, 16, 32, 64], shuffled=True)
+    assert launches.calls
+    kv_keys = [key for name, key in launches.keys if name in ("k3", "k5")]
+    assert kv_keys and all(key.shuffle for key in kv_keys)
+    assert any(key.attn for key in kv_keys)
     _assert_same_step(stock, mono)
 
 

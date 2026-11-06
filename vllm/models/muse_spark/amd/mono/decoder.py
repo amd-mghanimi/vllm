@@ -230,9 +230,19 @@ def config_refusals(config: Any) -> list[str]:
 
 
 def deployment_refusals(
-    vllm_config: Any, tp_rank: int, tp_size: int, moe_parallel: Any
+    vllm_config: Any,
+    tp_rank: int,
+    tp_size: int,
+    moe_parallel: Any,
+    shuffled_kv: bool = False,
 ) -> list[str]:
-    """Parallel layout and server features the monokernel does not support."""
+    """Parallel layout and server features the monokernel does not support.
+
+    ``shuffled_kv`` (the ROCm shuffle KV cache layout) is supported: the
+    builds then read and write the shuffled planes, and every step checks the
+    cache view against that layout (``kv_cache_refusal``).
+    """
+    del shuffled_kv
     reasons = []
     parallel = vllm_config.parallel_config
     if tp_size != WORLD_SIZE:
@@ -373,18 +383,44 @@ def layer_refusals(model: nn.Module, dims: MonoDims) -> list[str]:
     return reasons
 
 
-def kv_cache_refusal(kv_cache: torch.Tensor, kv_heads: int) -> str | None:
-    """K3 writes bf16 LBHNC pages: ``[block][kv head][16 tokens][K | V]``."""
+def kv_cache_refusal(
+    kv_cache: torch.Tensor, kv_heads: int, shuffled: bool = False
+) -> str | None:
+    """K3 writes bf16 LBHNC pages: ``[block][kv head][16 tokens][K | V]``, or,
+    under the AITER shuffle layout (``shuffled``), vLLM's two head slots
+    ``[block][K | V][16 tokens][heads x 64]`` as K and V planes of any slot
+    stride (LHBNC or LBHNC), each block of a plane shuffled in place.
+
+    The layout comes from ``shuffled``, not from the view: under LBHNC the
+    shuffled view has the dense shape and strides when there are 2 kv heads.
+    """
     if kv_cache.numel() == 0:
         return "kv:unbound"
     if kv_cache.dtype != torch.bfloat16:
         return f"kv:{kv_cache.dtype}"
+    if shuffled:
+        content = kv_heads * 64
+        if tuple(kv_cache.shape[1:]) != (2, KV_BLOCK_SIZE, content):
+            return f"kv:shuffled-shape{tuple(kv_cache.shape)}"
+        s = kv_cache.stride()
+        if s[2:] != (content, 1) or min(s[0], s[1]) < KV_BLOCK_SIZE * content:
+            return f"kv:shuffled-stride{s}"
+        return None
     want_shape = (kv_heads, KV_BLOCK_SIZE, 2 * 64)
     if tuple(kv_cache.shape[1:]) != want_shape:
         return f"kv:shape{tuple(kv_cache.shape)}"
     if tuple(kv_cache.stride()[1:]) != (KV_BLOCK_SIZE * 128, 128, 1):
         return f"kv:stride{tuple(kv_cache.stride())}"
     return None
+
+
+def kv_launch_args(kv_cache: torch.Tensor, shuffled: bool) -> tuple[int, int, int]:
+    """The launches' ``(k_cache, v_cache, v_plane)``: the K base, the block
+    stride in elements (a value, in the V slot) and the V plane base (shuffled:
+    head slot 1; dense: unused, the K base)."""
+    k = kv_cache.data_ptr()
+    v = k + kv_cache.stride(1) * kv_cache.element_size() if shuffled else k
+    return k, kv_cache.stride(0), v
 
 
 def attention_type(layer: nn.Module) -> str | None:
@@ -483,10 +519,12 @@ class _FusedAttention:
         rows: int,
         dims: MonoDims,
         device: torch.device,
+        shuffled_kv: bool = False,
     ) -> None:
         self.af = attn_frag
         self.layers = layers
         self.scales = scales
+        self.shuffled_kv = shuffled_kv
         self.out = torch.zeros(rows, dims.q_rows, dtype=torch.bfloat16, device=device)
         self.part = torch.zeros(
             attn_frag.part_bytes() // 4, dtype=torch.int32, device=device
@@ -520,6 +558,7 @@ class _FusedAttention:
                 self.part,
                 num_reqs,
                 self.scales[i],
+                shuffled=self.shuffled_kv,
             )
         key = tuple((i, *w) for i, w in rows.items())
         table = self.tables.get(key)
@@ -600,8 +639,7 @@ class _Bucket:
             rope = nxt.rotary_emb
             cos_sin = rope.cos_sin_cache if rope is not None else self.no_rope
             ptrs = (slots.data_ptr(), cos_sin.data_ptr(), positions.data_ptr())
-            # The kernels take the block stride (elements) in the V slot.
-            kv = (kv_cache.data_ptr(), kv_cache.stride(0), *ptrs)
+            kv = (*kv_launch_args(kv_cache, mono.shuffled_kv), *ptrs)
             stream, q, g = self.layer(mono, i, kind, attn_o, g, stream, kv, aux_layers)
             if i + 1 in aux_layers:
                 aux_hidden_states.append(stream.clone())
@@ -624,17 +662,22 @@ class _K3Bucket(_Bucket):
         group: Any,
         fa: _FusedAttention | None = None,
         fused_kinds: Sequence[tuple[bool, str]] = (),
+        shuffled_kv: bool = False,
     ) -> None:
         w = dims.world_size
         super().__init__(k3, k3.peer_layout(rows, w)[1], dims, device, group)
         self.launchers = {
-            next_rope: k3.build(k3.build_vllm(S=rows, W=w, next_rope=next_rope))
+            next_rope: k3.build(
+                k3.build_vllm(S=rows, W=w, next_rope=next_rope, shuffle=shuffled_kv)
+            )
             for next_rope in (True, False)
         }
         self.fa = fa
         self.fused_launchers = {
             (next_rope, kind): k3.build(
-                k3.build_vllm(S=rows, W=w, next_rope=next_rope, attn=kind)
+                k3.build_vllm(
+                    S=rows, W=w, next_rope=next_rope, attn=kind, shuffle=shuffled_kv
+                )
             )
             for next_rope, kind in fused_kinds
         }
@@ -703,9 +746,10 @@ class _K5Bucket(_Bucket):
         group: Any,
         fa: _FusedAttention | None = None,
         fused_kinds: Sequence[str] = (),
+        shuffled_kv: bool = False,
     ) -> None:
         w = dims.world_size
-        key = k5.build_vllm(S=rows, W=w, next_rope=True)
+        key = k5.build_vllm(S=rows, W=w, next_rope=True, shuffle=shuffled_kv)
         super().__init__(k5, k5.peer_layout(rows, w, key.bnd)[1], dims, device, group)
         self.bnd = key.bnd
         self.launch_a, launch_b = k5.build(key)
@@ -716,7 +760,7 @@ class _K5Bucket(_Bucket):
         self.launch_m = k5m.build(k5m.build_vllm(S=rows, W=w))
         self.fa = fa
         self.fused_launch_a = {
-            kind: k5.build(k5.build_vllm(S=rows, W=w, next_rope=True, attn=kind))[0]
+            kind: k5.build(dataclasses.replace(key, attn=kind))[0]
             for kind in fused_kinds
         }
         i32, f32, bf16 = torch.int32, torch.float32, torch.bfloat16
@@ -833,9 +877,11 @@ class MuseSparkMono:
         dims: MonoDims,
         buckets: Sequence[int],
         fused_attention: dict[int, str],
+        shuffled_kv: bool = False,
     ) -> None:
         self.rank = rank
         self.dims = dims
+        self.shuffled_kv = shuffled_kv
         self.refresh_weights(model)
         self.buckets: dict[int, _Bucket] = {}
         for b in buckets:
@@ -846,13 +892,15 @@ class MuseSparkMono:
                 scales = {
                     i: float(model.layers[i].self_attn.attn.impl.scale) for i in layers
                 }
-                fa = _FusedAttention(kernels.attn_frag, layers, scales, b, dims, device)
+                fa = _FusedAttention(
+                    kernels.attn_frag, layers, scales, b, dims, device, shuffled_kv
+                )
             if b in K3_ROWS:
                 k3_kinds = sorted(
                     {(self.weights[i].next_rope, t) for i, t in layers.items()}
                 )
                 self.buckets[b] = _K3Bucket(
-                    kernels.k3, b, dims, device, group, fa, k3_kinds
+                    kernels.k3, b, dims, device, group, fa, k3_kinds, shuffled_kv
                 )
             else:
                 self.buckets[b] = _K5Bucket(
@@ -864,6 +912,7 @@ class MuseSparkMono:
                     group,
                     fa,
                     sorted(set(layers.values())),
+                    shuffled_kv,
                 )
         self._validated: set[int] = set()
         self._fallbacks: set[str] = set()
@@ -901,7 +950,9 @@ class MuseSparkMono:
             return "positions"
         for name in names[1:]:
             _, _, kv_cache, slots = get_attention_context(name)
-            reason = kv_cache_refusal(kv_cache, self.dims.local_kv_heads)
+            reason = kv_cache_refusal(
+                kv_cache, self.dims.local_kv_heads, self.shuffled_kv
+            )
             if reason is not None:
                 return reason
             if (

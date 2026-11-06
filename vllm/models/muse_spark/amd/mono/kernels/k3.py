@@ -61,6 +61,7 @@ from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64
 
+from .attn_frag import store_kv_shuffled
 from .dev import (
     BLOCKS,
     CM_DEV,
@@ -406,6 +407,7 @@ class Build:
     S: int = 8  # rows (8 or 16)
     next_rope: bool = True  # the next layer has RoPE (SWA) or not (full, NoPE)
     attn: str = ""  # this layer's verify attention fused at the head ("swa" / "full"); "" = run before the launch
+    shuffle: bool = False  # AITER's shuffled KV cache (attn_frag.kv_planes)
 
 
 def _lay(items):
@@ -587,7 +589,7 @@ def build(key: Build):
         from . import attn_frag
 
         assert key.attn in ("swa", "full"), key
-        FA = attn_frag.make(S // 8, key.attn == "swa")
+        FA = attn_frag.make(S // 8, key.attn == "swa", shuffle=key.shuffle)
         FaLds = FA.Lds
         # the fragment's source hash: the disk cache does not follow FA.run
         _KEYSTR = _KEYSTR + FA.key
@@ -609,8 +611,10 @@ def build(key: Build):
         pad: fx.Array[fx.Int64, TL_POINTS, 16]
 
     UNR = S == 8  # gate_up / down task loops as a ring (unroll 3, fixed slots)
-    name = f"muse_k3_s{S}_r{int(key.next_rope)}" + (
-        f"_fa{key.attn}" if key.attn else ""
+    name = (
+        f"muse_k3_s{S}_r{int(key.next_rope)}"
+        + (f"_fa{key.attn}" if key.attn else "")
+        + ("_shuf" if key.shuffle else "")
     )
     CPRX = BLOCKS // W  # CTA blocks a rank owns (owner of block b = b // CPRX)
 
@@ -1909,7 +1913,9 @@ def build(key: Build):
         return out
 
     @traced
-    def vllm_finish(w2, hh, tt, p, q_out, k_cache, v_cache, slots, cos_sin, pos):
+    def vllm_finish(
+        w2, hh, tt, p, q_out, k_cache, v_cache, v_plane, slots, cos_sin, pos
+    ):
         """The owner's head finish: head hh (uniform), token tt (uniform in the wave), lane p = pair
         (2p, 2p + 1) of the head; w2 = the bf16 pair of the qkv GEMV.
         q / k as vLLM's fused_muse_spark_qknorm_rope_kv_insert: weightless qk-norm, then GPT-J RoPE in
@@ -1917,7 +1923,8 @@ def build(key: Build):
         through (the bf16 GEMV). K / V pairs go as one bf16 dword into the LBHNC cache, element
         ((slot >> 4) * bstride + (kv * 16 + (slot & 15)) * 128 + 64 isv + 2p), bstride = v_cache (the
         block stride in elements, a value, not a pointer); slot < 0 (padded rows) skipped. The block
-        base is 64-bit and wave-uniform (one buffer resource a wave)."""
+        base is 64-bit and wave-uniform (one buffer resource a wave). key.shuffle: the shuffled K / V
+        planes at k_cache / v_plane, both with block stride v_cache (attn_frag.store_kv_shuffled)."""
         x0 = bf_lo(w2)
         x1 = bf_hi(w2)
         ss = butterfly(x0 * x0 + x1 * x1, (1, 2, 4, 8, 16))
@@ -1944,13 +1951,25 @@ def build(key: Build):
             # int64 slot_mapping: low word (-1 = padding)
             slot = uniform(ld_i32(slots, tt * 2))
             if slot >= 0:
-                eoff = fx.Int64(slot >> 4) * v_cache + fx.Int64(
-                    (kv * 16 + (slot & 15)) * 128
-                    + isv.select(fx.Int32(HD), fx.Int32(0))
-                )
-                bo.buffer_store(
-                    bf16_pair(o0, o1), rsrc(k_cache + eoff * fx.Int64(2)), p
-                )
+                if const_expr(key.shuffle):
+                    blk = fx.Int64(slot >> 4) * v_cache * fx.Int64(2)
+                    store_kv_shuffled(
+                        bf16_pair(o0, o1),
+                        isv,
+                        kv,
+                        slot & 15,
+                        p,
+                        k_cache + blk,
+                        v_plane + blk,
+                    )
+                else:
+                    eoff = fx.Int64(slot >> 4) * v_cache + fx.Int64(
+                        (kv * 16 + (slot & 15)) * 128
+                        + isv.select(fx.Int32(HD), fx.Int32(0))
+                    )
+                    bo.buffer_store(
+                        bf16_pair(o0, o1), rsrc(k_cache + eoff * fx.Int64(2)), p
+                    )
 
     @traced
     def stage_qkv8(
@@ -1960,6 +1979,7 @@ def build(key: Build):
         g_out,
         k_cache,
         v_cache,
+        v_plane,
         slots,
         cos_sin,
         pos,
@@ -2082,7 +2102,9 @@ def build(key: Build):
             else:
                 st_if(row < QKVG_ROWS, w2, g_out, (tt * QROWS + row - QKV_ROWS) // 2)
             if head & (p < 32):
-                vllm_finish(w2, gq, tt, p, q_out, k_cache, v_cache, slots, cos_sin, pos)
+                vllm_finish(
+                    w2, gq, tt, p, q_out, k_cache, v_cache, v_plane, slots, cos_sin, pos
+                )
 
     # ------------------------------------------------------------ kernel
     @traced
@@ -2150,6 +2172,7 @@ def build(key: Build):
         g_out: Int64,
         k_cache: Int64,
         v_cache: Int64,
+        v_plane: Int64,
         slots: Int64,
         cos_sin: Int64,
         pos: Int64,
@@ -2374,6 +2397,7 @@ def build(key: Build):
             g_out,
             k_cache,
             v_cache,
+            v_plane,
             slots,
             cos_sin,
             pos,
@@ -2430,6 +2454,7 @@ def build(key: Build):
         g_out: Int64,
         k_cache: Int64,
         v_cache: Int64,
+        v_plane: Int64,
         slots: Int64,
         cos_sin: Int64,
         pos: Int64,
@@ -2486,6 +2511,7 @@ def build(key: Build):
             g_out,
             k_cache,
             v_cache,
+            v_plane,
             slots,
             cos_sin,
             pos,
@@ -2515,8 +2541,9 @@ def build(key: Build):
     return launch
 
 
-def build_vllm(S=8, W=8, next_rope=True, attn=""):
+def build_vllm(S=8, W=8, next_rope=True, attn="", shuffle=False):
     """The K3 build vLLM launches for S rows (8 / 16) of a TP = EP = 8 group; next_rope: the next
-    layer has RoPE; attn = "swa" / "full": this layer's verify attention fused at the head."""
+    layer has RoPE; attn = "swa" / "full": this layer's verify attention fused at the head;
+    shuffle: AITER's shuffled KV cache."""
     assert W == 8 and S in (8, 16), (S, W)
-    return Build(S=S, next_rope=bool(next_rope), attn=attn)
+    return Build(S=S, next_rope=bool(next_rope), attn=attn, shuffle=bool(shuffle))

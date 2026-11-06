@@ -55,6 +55,12 @@ def _load_kernels() -> tuple[MonoKernels | None, str | None]:
     return MonoKernels(**modules), None
 
 
+def _shuffled_kv() -> bool:
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    return rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+
+
 def static_refusals(lm: nn.Module, tp_rank: int, tp_size: int) -> list[str]:
     """Every reason this deployment cannot run the monokernel; empty = supported."""
     if not current_platform.is_rocm():
@@ -75,7 +81,9 @@ def static_refusals(lm: nn.Module, tp_rank: int, tp_size: int) -> list[str]:
     moe_parallel = getattr(
         getattr(experts, "moe_config", None), "moe_parallel_config", None
     )
-    reasons = deployment_refusals(lm.vllm_config, tp_rank, tp_size, moe_parallel)
+    reasons = deployment_refusals(
+        lm.vllm_config, tp_rank, tp_size, moe_parallel, _shuffled_kv()
+    )
     return reasons or layer_refusals(
         lm.model, MonoDims.from_config(text_config, tp_size)
     )
@@ -131,6 +139,7 @@ def maybe_attach_mono(lm: nn.Module) -> None:
         dims=MonoDims.from_config(text_config, world_size),
         buckets=buckets,
         fused_attention=fused,
+        shuffled_kv=_shuffled_kv(),
     )
     logger.info(
         "Muse Spark monokernel attached: layers %d-%d of verify steps with "

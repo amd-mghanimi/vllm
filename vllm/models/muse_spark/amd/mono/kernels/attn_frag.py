@@ -51,11 +51,17 @@ load the partials, merge (max trick) per thread, over lanes and over waves, out 
 -> attn_o and the same rows as tagged pairs (P_AO), which the consumer (K3 stage O, HA ng)
 polls directly.
 
-Descriptor (int64 words, device memory; vllm_desc): 0 q, 1 the KV cache base, 2 its block stride
-in elements (a value), 3 block table, 4 seq_lens, 5 attn_o (out), 6 part (scratch of
-part_bytes()), 7 block-table row stride (elements), 8 real requests (requests >= it are graph
-padding: no split, zero output rows, their flags still set), 9 the softmax scale x log2(e) as
-fp32 bits. A fragment's descriptor is row `layer` of a table of TABLE_ROWS rows.
+Descriptor (int64 words, device memory; vllm_desc): 0 q, 1 the KV cache base (shuffled: the K
+plane), 2 its block stride in elements (a value), 3 block table, 4 seq_lens, 5 attn_o (out), 6 part
+(scratch of part_bytes()), 7 block-table row stride (elements), 8 real requests (requests >= it are
+graph padding: no split, zero output rows, their flags still set), 9 the softmax scale x log2(e) as
+fp32 bits, 10 the V plane (shuffled), 11 unused. A fragment's descriptor is row `layer` of a table
+of TABLE_ROWS rows.
+
+Shuffled cache (make(shuffle=True); AITER's VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT, x = 8 bf16): a block
+of each plane is [kv head][64 d / 8][16 keys][8] for K and [kv head][16 keys / 8][64 d][8] for V,
+both planes with the same block stride. K tiles land in LDS as in the dense build; V lands as V^T
+([d][key]), whose two 4-key runs of an MFMA A operand are plain ds_read_b64.
 """
 
 from types import SimpleNamespace
@@ -99,8 +105,9 @@ PGMAX = 512  # page ids a CTA staged in one round (128 tiles)
 # keys a request the page staging covers (max_position_embeddings)
 VLLM_MAX_KEYS = 1 << 20
 REGION_IDS = {"aseg": 40}
-DESC_WORDS = 10
+DESC_WORDS = 12
 TABLE_ROWS = 64
+SX = 8  # bf16 a 16 B shuffle group
 
 # parts of the scratch buffer (bytes); the segment count is always BLOCKS (G x CPG <= 256)
 P_O = 0  # partial o, fp32 [seg][row][64]
@@ -123,9 +130,24 @@ def default_cpg(NR, swa):
     return BLOCKS // g
 
 
-def make(NR, swa, maxk=VLLM_MAX_KEYS):
+@traced
+def store_kv_shuffled(w2, isv, kv, tok, p, k_blk, v_blk):
+    """Pair (2p, 2p + 1) of head kv (w2: bf16 low, high) of token tok into the shuffled block
+    whose K / V plane bytes start at k_blk / v_blk (64-bit, wave-uniform): K as one dword, V as
+    two bf16 a 16 B group apart."""
+    if isv:
+        e = kv * (BS * HD) + (tok // SX) * (HD * SX) + 2 * p * SX + tok % SX
+        pair = fx.Vector.from_elements([w2], fx.Int32).bitcast(fx.BFloat16)
+        bo.buffer_store(pair[0], rsrc(v_blk), e * 2, offset_is_bytes=True)
+        bo.buffer_store(pair[1], rsrc(v_blk), e * 2 + 2 * SX, offset_is_bytes=True)
+    else:
+        e = kv * (BS * HD) + (p // 4) * (BS * SX) + tok * SX + 2 * (p % 4)
+        bo.buffer_store(w2, rsrc(k_blk), e // 2)
+
+
+def make(NR, swa, maxk=VLLM_MAX_KEYS, shuffle=False):
     """The fragment for NR requests; swa = SWA (window 2048) or full attention. It stages enough
-    page ids a CTA for maxk keys a request (PGN)."""
+    page ids a CTA for maxk keys a request (PGN); shuffle = AITER's shuffled KV cache."""
     # K / V load cache policy: cached for SWA, nontemporal for full
     KCM = 0 if swa else CM_NT
 
@@ -189,6 +211,7 @@ def make(NR, swa, maxk=VLLM_MAX_KEYS):
             pts=uniform(dv[14]),
             nreq=uniform(dv[16]),
             qks=uniform(dv[18]).bitcast(fx.Float32),
+            vp=p64(dv, 10),
         )
 
     def geom(d, req):
@@ -212,6 +235,42 @@ def make(NR, swa, maxk=VLLM_MAX_KEYS):
             rocdl.ds_read_tr16_b64(T.vec(4, T.bf16), ptr).result, (4,), fx.BFloat16
         )
 
+    def key_mask(key, seq_len, wlo):
+        ok = key < seq_len
+        if const_expr(swa):
+            ok = ok & (key >= wlo)
+        return ok
+
+    def kv_load_shuffled(d, tile, t1, seq_len, kvh, pg, lkey, lch, ok, wlo):
+        """K: key lkey's d [16 lch, 16 lch + 16) (two 16 B groups). V^T: d = 4 (lkey % 16) + lch
+        of the block's 16 keys (two 16 B groups); the loads take the whole block, so keys outside
+        [wlo, seq_len) are zeroed as the dense loads leave them."""
+        hoff = (fx.Int64(uniform(pg)) * d.v + fx.Int64(kvh * (BS * HD))) * fx.Int64(2)
+        kb = d.k + hoff
+        vb = d.vp + hoff
+        koff = lch * (BS * SX) + (lkey % BS) * (SX // 2)
+        k = [ld_vec_if(ok, kb, koff + o, 4, OOB_BOUND, KCM) for o in (0, BS * SX // 2)]
+        dcol = (lkey % BS) * 4 + lch
+        k0 = tile * TILE + (lkey // BS) * BS
+        bok = (tile < t1) & (k0 < seq_len)
+        if const_expr(swa):
+            bok = bok & (k0 + BS > wlo)
+        v = []
+        for tg in range_constexpr(2):
+            w4 = ld_vec_if(
+                bok, vb, dcol * (SX // 2) + tg * (HD * SX // 2), 4, OOB_BOUND, KCM
+            )
+            for i in range_constexpr(4):
+                key = k0 + SX * tg + 2 * i
+                lo = key_mask(key, seq_len, wlo).select(fx.Int32(0xFFFF), fx.Int32(0))
+                hi = key_mask(key + 1, seq_len, wlo).select(
+                    fx.Int32(-65536), fx.Int32(0)
+                )
+                v.append(w4[i] & (lo | hi))
+        return fx.Vector.from_elements(
+            [k[j][i] for j in range(2) for i in range(4)] + v, fx.Int32
+        )
+
     def kv_load(d, t0, t1, seq_len, kvh, step, pgl, ltl, lkey, lch, wlo=None):
         tile = t0 + 2 * step + ltl
         kg = tile * TILE + lkey
@@ -222,6 +281,8 @@ def make(NR, swa, maxk=VLLM_MAX_KEYS):
         if const_expr(swa):
             # keys before the window: no access (vLLM frees their blocks)
             ok = ok & (kg >= wlo)
+        if const_expr(shuffle):
+            return kv_load_shuffled(d, tile, t1, seq_len, kvh, pg, lkey, lch, ok, wlo)
         base = d.k + (
             fx.Int64(uniform(pg)) * d.v + fx.Int64(kvh * (BS * 2 * HD))
         ) * fx.Int64(2)
@@ -264,6 +325,9 @@ def make(NR, swa, maxk=VLLM_MAX_KEYS):
         for kind in range_constexpr(2):
             words = [kvc[8 * kind + i] for i in range(8)]
             b0 = ((ltl * 2 + kind) * 64 + lkey) * KPW + 8 * lch
+            if const_expr(shuffle and kind == 1):
+                dcol = (lkey % BS) * 4 + lch
+                b0 = ((ltl * 2 + 1) * 64 + dcol) * KPW + 8 * (lkey // BS)
             fx.ptr_store(fx.Vector.from_elements(words[:4], fx.Int32), kvl + b0)
             fx.ptr_store(fx.Vector.from_elements(words[4:], fx.Int32), kvl + b0 + 4)
         gpu.barrier()
@@ -323,12 +387,22 @@ def make(NR, swa, maxk=VLLM_MAX_KEYS):
                 fx.Int32,
             ).bitcast(fx.BFloat16)
             for j in range_constexpr(4):
-                row1 = 32 * c + 4 * g + r16 // 4
-                col = 16 * j + 4 * (r16 % 4)
-                vb = kvbase + (((wtl * 2 + 1) * 64 + row1) * KP + col) * 2
-                lo_ = tr16(kvl, vb)
-                hi_ = tr16(kvl, vb + 16 * KP * 2)
-                a = lo_.shuffle(hi_, [0, 1, 2, 3, 4, 5, 6, 7])
+                if const_expr(shuffle):
+                    # V^T row d = 16 j + r16: keys 32 c + 4 g + [0, 4) and 32 c + 16 + 4 g + [0, 4)
+                    vr = (
+                        kvl + ((wtl * 2 + 1) * 64 + 16 * j + r16) * KPW + 16 * c + 2 * g
+                    )
+                    v2 = fx.Vector.make_type(2, fx.Int32)
+                    lo_ = fx.Vector(fx.ptr_load(vr, result_type=v2))
+                    hi_ = fx.Vector(fx.ptr_load(vr + 8, result_type=v2))
+                    a = lo_.shuffle(hi_, [0, 1, 2, 3]).bitcast(fx.BFloat16)
+                else:
+                    row1 = 32 * c + 4 * g + r16 // 4
+                    col = 16 * j + 4 * (r16 % 4)
+                    vb = kvbase + (((wtl * 2 + 1) * 64 + row1) * KP + col) * 2
+                    lo_ = tr16(kvl, vb)
+                    hi_ = tr16(kvl, vb + 16 * KP * 2)
+                    a = lo_.shuffle(hi_, [0, 1, 2, 3, 4, 5, 6, 7])
                 acc[j] = mfma_bf16(a, pb, acc[j])
         return m, l, acc, kvn
 
@@ -614,7 +688,7 @@ def make(NR, swa, maxk=VLLM_MAX_KEYS):
     return SimpleNamespace(
         Lds=Lds,
         run=run,
-        key=f"attnfrag_nr{NR}_{'swa' if swa else 'full'}_c{CPG}_p{PD}_k{KCM}_{_SRC_HASH}",
+        key=f"attnfrag_nr{NR}_{'swa' if swa else 'full'}{'_shuf' if shuffle else ''}_c{CPG}_p{PD}_k{KCM}_{_SRC_HASH}",
     )
 
 
@@ -631,9 +705,30 @@ def vllm_scale_word(scale):
     return struct.unpack("<i", struct.pack("<f", float(scale) * LOG2E))[0]
 
 
-def vllm_desc(q, kv_cache, block_table, seq_lens, out, part, nreq, scale):
-    """The 10 descriptor words of one layer: q [8 nreq.., 16 x 64] bf16 rows,
-    kv_cache the layer's `[block][2][16][128]` bf16 view (block stride = kv_cache.stride(0)), block_table int32
+def kv_planes(kv_cache, shuffled=False):
+    """(K base, V base, block stride in elements) of a layer's bf16 cache view: dense
+    `[block][2 kv heads][16][K 64 | V 64]` (V base = K base), or shuffled `[block][K | V][16][2 x 64]`
+    (vLLM's two head slots, AITER reinterprets each slot's block in place)."""
+    import torch
+
+    assert kv_cache.dtype == torch.bfloat16, kv_cache.dtype
+    if not shuffled:
+        assert tuple(kv_cache.shape[1:]) == (HKV, BS, 2 * HD), kv_cache.shape
+        assert tuple(kv_cache.stride()[1:]) == (BS * 2 * HD, 2 * HD, 1), (
+            kv_cache.stride()
+        )
+        return kv_cache.data_ptr(), kv_cache.data_ptr(), kv_cache.stride(0)
+    assert tuple(kv_cache.shape[1:]) == (2, BS, HKV * HD), kv_cache.shape
+    assert tuple(kv_cache.stride()[2:]) == (HKV * HD, 1), kv_cache.stride()
+    v_ptr = kv_cache.data_ptr() + kv_cache.stride(1) * kv_cache.element_size()
+    return kv_cache.data_ptr(), v_ptr, kv_cache.stride(0)
+
+
+def vllm_desc(
+    q, kv_cache, block_table, seq_lens, out, part, nreq, scale, shuffled=False
+):
+    """The DESC_WORDS descriptor words of one layer: q [8 nreq.., 16 x 64] bf16 rows,
+    kv_cache the layer's bf16 view (kv_planes), block_table int32
     `[>= nreq][stride]` of the layer's group, seq_lens int32 [>= nreq], out attn_o [rows, 1024] bf16, part the scratch
     (int32, part_bytes()), nreq the requests of the step (graph padding included: seq_len 0 = no keys, zero rows)."""
     import torch
@@ -643,12 +738,7 @@ def vllm_desc(q, kv_cache, block_table, seq_lens, out, part, nreq, scale):
         and q.stride(-1) == 1
         and q.shape[-1] * (q.shape[-2] if q.dim() == 3 else 1) % (NH * HD) == 0
     )
-    assert kv_cache.dtype == torch.bfloat16 and tuple(kv_cache.shape[1:]) == (
-        HKV,
-        BS,
-        2 * HD,
-    ), kv_cache.shape
-    assert tuple(kv_cache.stride()[1:]) == (BS * 2 * HD, 2 * HD, 1), kv_cache.stride()
+    k_ptr, v_ptr, bstride = kv_planes(kv_cache, shuffled)
     assert (
         block_table.dtype == torch.int32
         and block_table.stride(1) == 1
@@ -666,8 +756,8 @@ def vllm_desc(q, kv_cache, block_table, seq_lens, out, part, nreq, scale):
     )
     return [
         q.data_ptr(),
-        kv_cache.data_ptr(),
-        kv_cache.stride(0),
+        k_ptr,
+        bstride,
         block_table.data_ptr(),
         seq_lens.data_ptr(),
         out.data_ptr(),
@@ -675,4 +765,6 @@ def vllm_desc(q, kv_cache, block_table, seq_lens, out, part, nreq, scale):
         block_table.stride(0),
         nreq,
         vllm_scale_word(scale),
+        v_ptr,
+        0,
     ]
