@@ -565,7 +565,7 @@ class MuseSpark1xAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Needs a model-written KV cache (ROCM_AITER_FA without shuffle layout).
+        # Needs a model-written KV cache (including the ROCm shuffle layout).
         self.fused_qk_norm_rope_kv_insert = (
             self.use_qk_norm
             and self.qk_norm is not None
