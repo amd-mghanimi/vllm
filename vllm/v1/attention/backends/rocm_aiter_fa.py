@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
@@ -508,13 +509,26 @@ class AiterFlashAttentionMetadataBuilder(
                 )
                 self.aot_sliding_window = sliding_window_config
 
+        if (
+            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            and is_quantized_kv_cache(vllm_config.cache_config.cache_dtype)
+            and self.reorder_batch_threshold > 1
+        ):
+            logger.warning_once(
+                "Shuffle KV cache layout with an fp8 KV cache and multi-token "
+                "decode: those rows run the Triton shuffled kernel, which can "
+                "be about 2x slower than the unshuffled layout."
+            )
+
         # Persistent so full CUDA graphs keep reading the same storage.
         self._swa_block_table: torch.Tensor | None = None
         self._swa_seq_lens: torch.Tensor | None = None
         self._swa_block_offsets: torch.Tensor | None = None
         if self.aot_sliding_window is not None:
             window = self.aot_sliding_window[0] + 1
-            num_window_blocks = cdiv(window, self.block_size) + 1
+            # A multi-token decode row's first query needs the window behind it.
+            span = window + self.reorder_batch_threshold - 1
+            num_window_blocks = cdiv(span, self.block_size) + 1
             max_num_reqs = vllm_config.scheduler_config.max_num_seqs
             self._swa_block_table = torch.zeros(
                 (max_num_reqs, num_window_blocks), dtype=torch.int32, device=device
@@ -551,6 +565,7 @@ class AiterFlashAttentionMetadataBuilder(
         seq_lens: torch.Tensor,
         num_decodes: int,
         max_seq_len: int,
+        max_query_len: int = 1,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
         """Trim the decode block table to the sliding window.
 
@@ -564,7 +579,14 @@ class AiterFlashAttentionMetadataBuilder(
         ):
             return None, None, 0
         assert self._swa_seq_lens is not None and self._swa_block_offsets is not None
-        window = self.aot_sliding_window[0] + 1
+        window = self.aot_sliding_window[0] + max_query_len
+        # The buffer was sized for the decode threshold at init; a kept span
+        # of up to window + block_size - 1 tokens must fit in it.
+        if (
+            cdiv(window + self.block_size - 1, self.block_size)
+            > self._swa_block_table.shape[1]
+        ):
+            return None, None, 0
         lens = seq_lens[:num_decodes]
         first_block = torch.clamp(lens - window, min=0) // self.block_size
         index = (first_block.to(torch.int64)[:, None] + self._swa_block_offsets).clamp_(
@@ -674,13 +696,18 @@ class AiterFlashAttentionMetadataBuilder(
         if num_decodes > 0:
             decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
             swa_block_table, swa_seq_lens, swa_max_seq_len = None, None, 0
-            if decode_max_query_len == 1:
+            # Shuffle sliding-window decode reads the trimmed table for every
+            # query length; the unshuffled paged kernel only does for q = 1.
+            if decode_max_query_len == 1 or (
+                rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            ):
                 swa_block_table, swa_seq_lens, swa_max_seq_len = (
                     self._build_swa_decode_tables(
                         common_attn_metadata.block_table_tensor,
                         common_attn_metadata.seq_lens,
                         num_decodes,
                         common_attn_metadata.max_seq_len,
+                        decode_max_query_len,
                     )
                 )
             decode_metadata = AiterFlashAttentionDecodeMetadata(
@@ -921,6 +948,9 @@ class AiterFlashAttentionBackend(AttentionBackend):
     supports_kv_cache_update_bypass: bool = (
         not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
     )
+    # The Muse-Spark fused writer has a shuffle-layout specialization. Keep
+    # generic external writers on the packed-layout-only bypass capability.
+    supports_muse_spark_fused_kv_insert: bool = True
 
     @staticmethod
     def get_name() -> str:
@@ -994,7 +1024,8 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_non_causal(cls) -> bool:
-        return True
+        # The shuffle layout has no non-causal multi-token decode kernel.
+        return not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
 
 
 class AiterFlashAttentionImpl(AttentionImpl):
@@ -1033,6 +1064,16 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+
+        if rocm_aiter_ops.is_shuffle_kv_cache_enabled() and (
+            alibi_slopes is not None or logits_soft_cap
+        ):
+            # paged_attention_common, the single-token full-attention decode
+            # kernel for this layout, takes neither.
+            raise NotImplementedError(
+                "ALiBi and logits soft cap are not supported with the shuffle "
+                "KV cache layout; unset VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT."
+            )
 
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
@@ -1096,7 +1137,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
             token_to_batch=swa_token_to_batch,
             seq_starts=swa_seq_starts,
             dequant=is_quantized_kv_cache(self.kv_cache_dtype),
-            kv_cache_layout="NHD",
+            # The gather indexes by stride. Reading a shuffled cache as NHD
+            # returns the right shape and the wrong tokens.
+            kv_cache_layout="SHUFFLE"
+            if rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            else "NHD",
             total_tokens=swa_total_tokens,
         )
 
@@ -1432,10 +1477,21 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 or self.sinks is not None
             ):
                 k_descale, v_descale = self._get_kv_cache_descales(layer, num_decodes)
-                assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
-                    "Shuffle KV cache layout is not supported with sliding "
-                    "window, sinks, or speculative decoding (multi-token decode)."
-                )
+                if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
+                    self._shuffle_decode(
+                        layer,
+                        query,
+                        key_cache,
+                        value_cache,
+                        output,
+                        attn_metadata,
+                        num_decodes,
+                        num_decode_tokens,
+                        decode_max_query_len,
+                        k_descale,
+                        v_descale,
+                    )
+                    return
                 if not attn_metadata.causal:
                     from aiter.ops.triton.attention.mha_v3 import (
                         flash_attn_with_kvcache,
@@ -1535,6 +1591,27 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     q_descale=None,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                )
+            elif rocm_aiter_ops.is_shuffle_kv_cache_enabled() and (
+                # paged_attention_common addresses pages arithmetically and
+                # needs K and V as dense planes (LHBNC). A block-compact
+                # layout (LBHNC, chosen when a draft spec mixes HNC shapes)
+                # interleaves the two sides, so read it by stride.
+                key_cache.stride(0) != key_cache[0].numel()
+            ):
+                k_descale, v_descale = self._get_kv_cache_descales(layer, num_decodes)
+                self._shuffle_decode(
+                    layer,
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    attn_metadata,
+                    num_decodes,
+                    num_decode_tokens,
+                    decode_max_query_len,
+                    k_descale,
+                    v_descale,
                 )
             elif rocm_aiter_ops.is_shuffle_kv_cache_enabled():
                 _, num_heads, head_size = query.shape
@@ -1652,6 +1729,66 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 )
 
         return output
+
+    def _shuffle_decode(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: AiterFlashAttentionMetadata,
+        num_decodes: int,
+        num_decode_tokens: int,
+        decode_max_query_len: int,
+        k_descale: torch.Tensor | None,
+        v_descale: torch.Tensor | None,
+    ) -> None:
+        """Sliding-window, sink, or multi-token decode over a shuffled cache.
+
+        ``paged_attention_common`` covers single-token full attention on dense
+        K/V planes only. Everything else is read by stride and goes to shuffled
+        ``unified_attention``. That kernel needs aiter #7566: before it, a
+        sliding-window q=1 row did not split and ``pa_decode_gluon`` was
+        faster. With #7566, unified attention is faster on the Muse Spark
+        shape for both the window and full attention, at q=1 and q=8.
+        """
+        # A single trailing query sees the same keys either way.
+        if not attn_metadata.causal and decode_max_query_len > 1:
+            raise NotImplementedError(
+                "Shuffle KV cache layout has no non-causal decode kernel. "
+                "Run a non-causal drafter on a backend that keeps its own "
+                "unshuffled cache."
+            )
+        num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+        x = 16 // key_cache.element_size()
+        k = key_cache.reshape(num_blocks, num_kv_heads, head_size // x, block_size, x)
+        v = value_cache.reshape(
+            num_blocks, num_kv_heads, block_size // x, head_size, x
+        )
+        from aiter.ops.triton.unified_attention import unified_attention
+
+        unified_attention(
+            q=query[:num_decode_tokens],
+            k=k,
+            v=v,
+            out=output[:num_decode_tokens],
+            cu_seqlens_q=attn_metadata.query_start_loc[: num_decodes + 1],
+            max_seqlen_q=decode_max_query_len,
+            seqused_k=attn_metadata.seq_lens[:num_decodes],
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            window_size=self.sliding_window,
+            block_table=attn_metadata.block_table[:num_decodes],
+            softcap=self.logits_soft_cap,
+            q_descale=None,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=self.sinks,
+            shuffled_kv_cache=True,
+        )
 
     def _split_kv_cache(
         self, kv_cache: torch.Tensor

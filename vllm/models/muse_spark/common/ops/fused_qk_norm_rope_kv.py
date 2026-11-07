@@ -31,11 +31,36 @@ def supports_fused_kv_insert(attn_layer: torch.nn.Module) -> bool:
         return False
     if attn_layer.attn_backend.forward_includes_kv_cache_update:
         return False
-    if not attn_layer.attn_backend.supports_kv_cache_update_bypass:
+    if not (
+        attn_layer.attn_backend.supports_kv_cache_update_bypass
+        or getattr(
+            attn_layer.attn_backend, "supports_muse_spark_fused_kv_insert", False
+        )
+    ):
         return False
     if attn_layer.kv_sharing_target_layer_name is not None:
         return False
     return attn_layer.kv_cache_dtype in SUPPORTED_KV_CACHE_DTYPES
+
+
+def split_shuffled_kv_cache(
+    kv_cache: torch.Tensor, num_kv_heads: int, head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the K/V views consumed by the shuffle cache writers."""
+    return kv_cache.unflatten(-1, (num_kv_heads, head_dim)).unbind(1)
+
+
+def shuffle_insert_kwargs(
+    kv_cache: torch.Tensor, num_kv_heads: int, head_dim: int
+) -> dict[str, Any]:
+    key_cache, value_cache = split_shuffled_kv_cache(
+        kv_cache, num_kv_heads, head_dim
+    )
+    return {
+        "shuffled_k_cache": key_cache,
+        "shuffled_v_cache": value_cache,
+        "block_size": key_cache.shape[1],
+    }
 
 
 def fused_qk_norm_rope_kv_insert(
@@ -85,14 +110,25 @@ def fused_qk_norm_rope_kv_insert(
     if insert:
         kv_cache_dtype = attn_layer.kv_cache_dtype
         is_fp8 = kv_cache_dtype not in ("auto", "bfloat16", "float16")
+        shuffle = getattr(
+            attn_layer.attn_backend, "supports_muse_spark_fused_kv_insert", False
+        ) and not getattr(
+            attn_layer.attn_backend, "supports_kv_cache_update_bypass", True
+        )
         insert_kwargs = {
             "slot_mapping": slot_mapping,
-            "kv_cache": kv_cache,
-            "block_size": kv_cache.shape[2],
             "kv_cache_dtype": kv_cache_dtype,
             "k_scale": attn_layer._k_scale if is_fp8 else None,
             "v_scale": attn_layer._v_scale if is_fp8 else None,
         }
+        if shuffle:
+            insert_kwargs.update(
+                shuffle_insert_kwargs(kv_cache, num_kv_heads, head_dim)
+            )
+        else:
+            insert_kwargs.update(
+                {"kv_cache": kv_cache, "block_size": kv_cache.shape[2]}
+            )
 
     ops.fused_muse_spark_qknorm_rope_kv_insert(
         qkv,

@@ -243,6 +243,111 @@ def test_kv_insert(num_tokens, nq, nkv, kv_cache_dtype, use_rope):
         assert_fp8_cache_close(kv_cache, expected)
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm shuffle layout")
+@pytest.mark.parametrize(
+    "num_tokens,block_size,kv_cache_dtype,use_rope,with_gate,rotary_dim",
+    [
+        (1, 16, "auto", True, True, HEAD_DIM),
+        (19, 32, "auto", False, False, 0),
+        (321, 16, "fp8", True, True, 32),
+    ],
+)
+def test_shuffle_kv_insert_matches_triton(
+    num_tokens, block_size, kv_cache_dtype, use_rope, with_gate, rotary_dim
+):
+    from vllm.v1.attention.backends.rocm_aiter_fa import (
+        reshape_and_cache_shuffle_triton,
+    )
+
+    device, dtype, eps, nq, nkv = "cuda", torch.bfloat16, 1e-5, 16, 2
+    qkv, qsz, kvsz, gate = make_case(
+        num_tokens, nq, nkv, dtype, device, with_gate=with_gate, seed=11
+    )
+    original = qkv.clone()
+    cos_sin = (
+        make_cos_sin_cache(4096, rotary_dim, 500_000.0, device)
+        if use_rope
+        else None
+    )
+    positions = torch.randint(0, 4096, (num_tokens,), dtype=torch.int64, device=device)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    storage = torch.uint8 if kv_cache_dtype == "fp8" else dtype
+    cache = torch.zeros(
+        num_blocks, 2, block_size, nkv * HEAD_DIM, dtype=storage, device=device
+    )
+    expected = torch.zeros_like(cache)
+    key_cache, value_cache = cache.unflatten(-1, (nkv, HEAD_DIM)).unbind(1)
+    exp_k, exp_v = expected.unflatten(-1, (nkv, HEAD_DIM)).unbind(1)
+    if kv_cache_dtype == "fp8":
+        key_cache = key_cache.view(current_platform.fp8_dtype())
+        value_cache = value_cache.view(current_platform.fp8_dtype())
+        exp_k = exp_k.view(current_platform.fp8_dtype())
+        exp_v = exp_v.view(current_platform.fp8_dtype())
+    slots = torch.randperm(num_blocks * block_size, device=device)[:num_tokens]
+    slots = slots.to(torch.int64)
+    slots[::3] = -1
+    k_scale = torch.tensor(0.37, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(1.83, dtype=torch.float32, device=device)
+
+    ops.fused_muse_spark_qknorm_rope_kv_insert(
+        qkv,
+        positions,
+        nq,
+        nkv,
+        HEAD_DIM,
+        eps,
+        cos_sin_cache=cos_sin,
+        rotary_dim=rotary_dim,
+        slot_mapping=slots,
+        block_size=block_size,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=k_scale if kv_cache_dtype == "fp8" else None,
+        v_scale=v_scale if kv_cache_dtype == "fp8" else None,
+        shuffled_k_cache=key_cache,
+        shuffled_v_cache=value_cache,
+    )
+    q_out, k_out, v_out, _ = split_qkv(qkv, qsz, kvsz, gate)
+    q_in, k_in, v_in, _ = split_qkv(original, qsz, kvsz, gate)
+    torch.testing.assert_close(
+        q_out,
+        qk_norm_rope_ref(
+            q_in.view(num_tokens, nq, HEAD_DIM),
+            positions,
+            cos_sin,
+            rotary_dim,
+            eps,
+        ).view_as(q_out),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        k_out,
+        qk_norm_rope_ref(
+            k_in.view(num_tokens, nkv, HEAD_DIM),
+            positions,
+            cos_sin,
+            rotary_dim,
+            eps,
+        ).view_as(k_out),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    reshape_and_cache_shuffle_triton(
+        k_out.view(num_tokens, nkv, HEAD_DIM),
+        v_out.view(num_tokens, nkv, HEAD_DIM),
+        exp_k,
+        exp_v,
+        slots,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+    if kv_cache_dtype == "auto":
+        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+    else:
+        assert_fp8_cache_close(cache, expected)
+
+
 # The fused Q output requires E4M3FN; scaled_fp8_quant uses the platform dtype.
 @pytest.mark.skipif(
     current_platform.is_rocm() and current_platform.fp8_dtype() != torch.float8_e4m3fn,
@@ -383,11 +488,11 @@ def test_rocm_aiter_fa_takes_the_fused_kv_insert(monkeypatch):
         kv_sharing_target_layer_name=None,
         kv_cache_dtype="auto",
     )
-    # The kernel writes the packed [B, H, N, 2*hd] page, so the backend only
-    # accepts the bypass outside the shuffle layout.
+    # Generic writers remain packed-layout-only, but Muse's writer can use the
+    # dedicated shuffled K/V cache arguments.
     shuffle = rocm_aiter_ops.is_shuffle_kv_cache_enabled()
     assert AiterFlashAttentionBackend.supports_kv_cache_update_bypass is not shuffle
-    assert fused_ops.supports_fused_kv_insert(attn_layer) is not shuffle
+    assert fused_ops.supports_fused_kv_insert(attn_layer)
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm compile boundary")
