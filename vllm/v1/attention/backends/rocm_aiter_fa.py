@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
-import functools
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
@@ -44,49 +43,6 @@ from vllm.v1.kv_cache_interface import (
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
-# pa_decode_gluon is exact through query length 8 (DSpark K=7, q = 1 + K).
-# Wider rows fall back to shuffled unified attention. Stock AITER asserts
-# query_length <= 4; ROCm/aiter#7454 raises that to 8:
-# https://github.com/ROCm/aiter/pull/7454
-# Without that change this call raises.
-_SHUFFLE_GLUON_MAX_QUERY_LEN = 8
-# The kernel flattens query_length * (q heads per KV head) into one MFMA
-# tile and only has layouts through 64.
-_SHUFFLE_GLUON_MAX_QUERY_GROUP = 64
-# Fill about two waves per CU (256 CUs * occupancy 2) and stop at 32:
-# the persistent reduce is wrong above 32 partitions.
-_GLUON_TARGET_PROGRAMS = 512
-_GLUON_MAX_SPLITS = 32
-# Full-attention rows: measured on one MI355X rank, q=8, head 64. Below this
-# batch, shuffled unified_attention is as fast or faster.
-_GLUON_FULL_MIN_SEQS = 16
-
-
-def _gluon_num_splits(num_seqs: int, num_kv_heads: int, num_keys: int) -> int:
-    """KV splits for one pa_decode_gluon launch.
-
-    ``cdiv(keys, 256)`` over-splits once the batch is wide: at q=8 the same
-    kernel is faster with fewer splits (one split from ~192 requests).
-    """
-    tiles = cdiv(max(num_keys, 1), _PARTITION_SIZE_ROCM)
-    per_split = max(1, num_seqs * num_kv_heads)
-    target = max(1, _GLUON_TARGET_PROGRAMS // per_split)
-    return max(1, min(tiles, _GLUON_MAX_SPLITS, target))
-
-
-@functools.cache
-def _pa_decode_gluon():
-    """aiter's pa_decode_gluon, or None where it cannot run: it asserts
-    CDNA3/CDNA4, and older aiter builds do not ship it."""
-    from vllm.platforms.rocm import get_cdna_version
-
-    if get_cdna_version() not in (3, 4):
-        return None
-    try:
-        from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
-    except ImportError:
-        return None
-    return pa_decode_gluon
 
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
@@ -1789,10 +1745,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
         """Sliding-window, sink, or multi-token decode over a shuffled cache.
 
         ``paged_attention_common`` covers single-token full attention on dense
-        K/V planes only. Everything else is read by stride. Uniform short rows
-        go to ``pa_decode_gluon``: sliding-window rows on the trimmed block
-        table, and full-attention rows from ``_GLUON_FULL_MIN_SEQS`` requests
-        on the full table. The rest go to shuffled ``unified_attention``.
+        K/V planes only. Everything else is read by stride and goes to shuffled
+        ``unified_attention``. That kernel needs aiter #7566: before it, a
+        sliding-window q=1 row did not split and ``pa_decode_gluon`` was
+        faster. With #7566, unified attention is faster on the Muse Spark
+        shape for both the window and full attention, at q=1 and q=8.
         """
         # A single trailing query sees the same keys either way.
         if not attn_metadata.causal and decode_max_query_len > 1:
@@ -1807,63 +1764,6 @@ class AiterFlashAttentionImpl(AttentionImpl):
         v = value_cache.reshape(
             num_blocks, num_kv_heads, block_size // x, head_size, x
         )
-        uniform = num_decode_tokens == num_decodes * decode_max_query_len
-        decode_md = attn_metadata.decode_metadata
-        swa = self.sliding_window[0] != -1
-        gluon_shape = (
-            uniform
-            and decode_max_query_len <= _SHUFFLE_GLUON_MAX_QUERY_LEN
-            and decode_max_query_len * self.num_queries_per_kv
-            <= _SHUFFLE_GLUON_MAX_QUERY_GROUP
-            and block_size in (16, 64)
-            and (pa_decode_gluon := _pa_decode_gluon()) is not None
-        )
-        use_swa_gluon = (
-            swa
-            and gluon_shape
-            and decode_md is not None
-            and decode_md.swa_block_table is not None
-        )
-        # Below _GLUON_FULL_MIN_SEQS the full-attention gluon launch does not
-        # beat shuffled unified_attention, and its persistent reduce is wrong
-        # once the split count exceeds _GLUON_MAX_SPLITS.
-        use_full_gluon = (
-            not swa and gluon_shape and num_decodes >= _GLUON_FULL_MIN_SEQS
-        )
-        if use_swa_gluon or use_full_gluon:
-            fp8 = is_quantized_kv_cache(self.kv_cache_dtype)
-            if use_swa_gluon:
-                assert decode_md is not None and decode_md.swa_seq_lens is not None
-                seq_lens = decode_md.swa_seq_lens
-                block_table = decode_md.swa_block_table
-                max_keys = decode_md.swa_max_seq_len
-                # The persistent kernel counts the window back from the end of
-                # the context, the query rows included: row r keeps keys from
-                # context_length - sliding_window + r + 1.
-                sliding_window = self.sliding_window[0] + 1 + decode_max_query_len
-            else:
-                seq_lens = attn_metadata.seq_lens[:num_decodes]
-                block_table = attn_metadata.block_table[:num_decodes]
-                max_keys = attn_metadata.max_seq_len
-                sliding_window = 0
-            pa_decode_gluon(
-                output[:num_decode_tokens],
-                query[:num_decode_tokens],
-                k,
-                v,
-                seq_lens,
-                block_table,
-                self.scale,
-                decode_max_query_len,
-                _gluon_num_splits(num_decodes, num_kv_heads, max_keys),
-                _PARTITION_SIZE_ROCM,
-                compute_type=query.dtype,
-                key_scale=layer._k_scale if fp8 else None,
-                value_scale=layer._v_scale if fp8 else None,
-                sinks=self.sinks,
-                sliding_window=sliding_window,
-            )
-            return
         from aiter.ops.triton.unified_attention import unified_attention
 
         unified_attention(
