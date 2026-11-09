@@ -24,6 +24,7 @@ from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     determine_expert_map,
 )
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+    AiterQuantType,
     derive_aiter_quant_type,
     mxfp4_w4a16_extra_kwargs,
     rocm_aiter_fused_experts,
@@ -33,6 +34,9 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
     make_mxfp4_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+    UnquantizedMoeBackend,
 )
 from vllm.model_executor.layers.quantization.quark.quark_moe import (
     QuarkOCP_MX_MoEMethod,
@@ -47,6 +51,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.models.muse_spark.amd.muse_moe_runner import (
     MuseMoERunner,
     MuseSparkAiterExperts,
+    MuseSparkAiterUnquantizedExperts,
     MuseSparkOnlineMXFP4FusedMoE,
     MuseSparkQuarkOCPMXFusedMoE,
     MuseSparkQuarkOCPMXMoEQuantConfig,
@@ -313,7 +318,7 @@ def test_muse_fp8_method_requires_route_preserving_triton(monkeypatch) -> None:
         MuseSparkQuarkW8A8Fp8FusedMoE(config, kFp8StaticChannelSym, kFp8DynamicTokenSym)
 
 
-def test_muse_unquantized_method_is_pinned_to_triton(
+def test_muse_unquantized_method_is_pinned_to_aiter(
     monkeypatch, default_vllm_config
 ) -> None:
     def _unexpected_backend_selection(*args, **kwargs):
@@ -325,7 +330,12 @@ def test_muse_unquantized_method_is_pinned_to_triton(
         _unexpected_backend_selection,
     )
     method = MuseSparkUnquantizedFusedMoE(_moe_config(moe_backend="auto"))
-    assert method.experts_cls is MuseSparkTritonExperts
+    assert method.experts_cls is MuseSparkAiterUnquantizedExperts
+    assert method.unquantized_backend is UnquantizedMoeBackend.AITER
+    assert MuseSparkAiterUnquantizedExperts._AITER_QUANT_TYPE is AiterQuantType.NO
+    # An existing serve flag must still start; these layers run AITER either way.
+    MuseSparkUnquantizedFusedMoE(_moe_config(moe_backend="triton"))
+    MuseSparkUnquantizedFusedMoE(_moe_config(moe_backend="aiter"))
 
 
 def test_muse_quant_config_ignores_cached_properties(default_vllm_config) -> None:
@@ -434,7 +444,11 @@ _FAIL_CLOSED_EVERYWHERE = [
     "validate,config,reason",
     [(validate_mxfp4_deployment, *case) for case in _FAIL_CLOSED_EVERYWHERE]
     + [
-        (validate_bf16_deployment, _moe_config(moe_backend="aiter"), "Triton"),
+        (
+            validate_bf16_deployment,
+            _moe_config(moe_backend="cutlass"),
+            "unquantized MoE",
+        ),
         (validate_fp8_deployment, _moe_config(moe_backend="auto"), "Triton"),
         (validate_fp8_deployment, _moe_config(moe_backend="aiter"), "Triton"),
     ],
