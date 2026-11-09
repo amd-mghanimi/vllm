@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
     AiterMxfp4Experts,
+    AiterUnquantizedExperts,
     rocm_aiter_fused_experts,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
@@ -122,9 +123,9 @@ def _validate_tp_post_norm_deployment(
 def validate_bf16_deployment(moe_config: FusedMoEConfig) -> None:
     """Reject deployments whose BF16 finalization is not implemented."""
     _validate_tp_post_norm_deployment(moe_config, "BF16")
-    if moe_config.moe_backend not in ("auto", "triton"):
+    if moe_config.moe_backend not in ("auto", "triton", "aiter"):
         raise NotImplementedError(
-            "Muse Spark BF16 on ROCm requires the Triton MoE backend; got "
+            "Muse Spark BF16 on ROCm uses the AITER unquantized MoE; got "
             f"{moe_config.moe_backend!r}."
         )
 
@@ -459,14 +460,18 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
 
 
 class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
-    """BF16 MoE method pinned to the MuseSpark-aware Triton experts."""
+    """BF16 MoE method pinned to AITER's a16w16 experts.
+
+    AITER selects the kernel from the unquantized fused-MoE table. The
+    generic backend oracle is skipped: it would hand back a summed
+    `[T, H]` tensor, and Muse Spark normalises each route first.
+    """
 
     def __init__(self, moe: FusedMoEConfig) -> None:
         validate_bf16_deployment(moe)
-        # Triton-only: skip the generic constructor's backend oracle.
         FusedMoEMethodBase.__init__(self, moe)
-        self.unquantized_backend = UnquantizedMoeBackend.TRITON
-        self.experts_cls = MuseSparkTritonExperts
+        self.unquantized_backend = UnquantizedMoeBackend.AITER
+        self.experts_cls = MuseSparkAiterUnquantizedExperts
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         base_config = super().get_fused_moe_quant_config(layer)
@@ -480,6 +485,155 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
                 if f.init
             },
             post_expert_norm_fn=post_expert_norm_fn,
+        )
+
+
+class MuseSparkAiterUnquantizedExperts(_RouteOutputHandoff, AiterUnquantizedExperts):
+    """BF16 AITER experts that return one unweighted output per route.
+
+    `AiterUnquantizedExperts` selects the a16w16 kernel. `fused_moe` sums
+    the top-k, so this runs one row per route with unit weights. The MXFP4
+    expert class keeps its own apply, including the staged path.
+    """
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+    ) -> None:
+        super().__init__(moe_config, quant_config)
+        if not isinstance(quant_config, MuseSparkUnquantizedMoEQuantConfig):
+            raise TypeError(
+                "MuseSparkAiterUnquantizedExperts requires "
+                "MuseSparkUnquantizedMoEQuantConfig."
+            )
+        if quant_config.post_expert_norm_fn is None:
+            raise ValueError("Muse Spark post-expert norm is not configured.")
+        self._unit_weights_bufs: dict[int, torch.Tensor] = {}
+
+    def _unit_weights(
+        self, num_routes: int, width: int, device: torch.device
+    ) -> torch.Tensor:
+        """A cached `[num_routes, width]` fp32 ones buffer (grown on demand)."""
+        buf = self._unit_weights_bufs.get(width)
+        if buf is None or buf.shape[0] < num_routes or buf.device != device:
+            buf = torch.ones(
+                (max(num_routes, 1), width), dtype=torch.float32, device=device
+            )
+            self._unit_weights_bufs[width] = buf
+        return buf[:num_routes]
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        workspace13, workspace2, _ = super().workspace_shapes(
+            M,
+            N,
+            K,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
+        return workspace13, workspace2, (M, topk, K)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        if apply_router_weight_on_input:
+            raise NotImplementedError(
+                "Muse Spark requires router weights after the post-expert norm."
+            )
+
+        num_tokens, top_k = topk_ids.shape
+        hidden_dim = hidden_states.shape[-1]
+        expected_output_shape = (num_tokens, top_k, hidden_dim)
+        if output.shape != expected_output_shape:
+            raise ValueError(
+                "Muse Spark AITER output has shape "
+                f"{tuple(output.shape)}, expected {expected_output_shape}."
+            )
+
+        expanded_hidden_states = take_expanded(hidden_states, top_k)
+        if expanded_hidden_states is None:
+            expanded_hidden_states = (
+                hidden_states[:, None, :]
+                .expand(num_tokens, top_k, hidden_dim)
+                .reshape(num_tokens * top_k, hidden_dim)
+                .contiguous()
+            )
+        # Only the shape of topk_ids is read after the experts.
+        num_routes = num_tokens * top_k
+        flat_topk_ids = topk_ids.view(num_routes, 1)
+        if expert_map is not None:
+            # AITER's EP convention: one extra route per row on the always-masked
+            # last expert_mask slot; its tuned-config lookup subtracts it.
+            masked_slot = flat_topk_ids.new_full(
+                (num_routes, 1), expert_map.shape[0] - 1
+            )
+            flat_topk_ids = torch.cat((flat_topk_ids, masked_slot), dim=1)
+        unit_topk_weights = self._unit_weights(
+            num_routes, flat_topk_ids.shape[1], topk_ids.device
+        )
+
+        if expert_tokens_meta is not None:
+            num_local_tokens = expert_tokens_meta.expert_num_tokens
+        else:
+            num_local_tokens = None
+
+        route_output = rocm_aiter_fused_experts(
+            hidden_states=expanded_hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=unit_topk_weights,
+            topk_ids=flat_topk_ids,
+            activation=activation,
+            expert_mask=expert_map,
+            quant_config=self.quant_config,
+            quant_type=self._AITER_QUANT_TYPE,
+            moe_config=self.moe_config,
+            a1q_scale=a1q_scale,
+            num_local_tokens=num_local_tokens,
+            output_dtype=output.dtype,
+            moe_sorting_dispatch_policy=rocm_aiter_ops.get_moe_dispatch_policy(),
+            apply_router_weight_on_input=False,
+            **self._extra_fused_moe_kwargs(),
+        )
+        self._park_route_output(route_output.view_as(output))
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        quant_config = self.quant_config
+        assert isinstance(quant_config, MuseSparkUnquantizedMoEQuantConfig)
+        assert quant_config.post_expert_norm_fn is not None
+        return MuseSparkTopKWeightAndReduce(
+            quant_config.post_expert_norm_fn,
+            pre_norm_all_reduce=self.moe_config.moe_parallel_config.tp_size > 1,
+            take_route_output=self._take_route_output,
+            take_route_expert_map=self._take_route_expert_map,
         )
 
 
@@ -1015,6 +1169,7 @@ __all__ = [
     "MuseMoERunner",
     "MuseSparkRouter",
     "MuseSparkAiterExperts",
+    "MuseSparkAiterUnquantizedExperts",
     "MuseSparkQuarkFp8MoEQuantConfig",
     "MuseSparkQuarkOCPMXFusedMoE",
     "MuseSparkQuarkW8A8Fp8FusedMoE",
