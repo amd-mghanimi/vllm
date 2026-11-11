@@ -141,6 +141,7 @@ def column_sharded_down_supported(moe_config: FusedMoEConfig) -> bool:
     tp_size = parallel_config.tp_size
     return (
         tp_size > 1
+        and parallel_config.dp_size == 1
         and not parallel_config.use_ep
         and moe_config.activation == MoEActivation.SILU
         and not moe_config.has_bias
