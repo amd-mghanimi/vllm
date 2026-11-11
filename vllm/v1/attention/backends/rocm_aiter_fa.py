@@ -841,7 +841,10 @@ class AiterFlashAttentionMetadataBuilder(
                 chunk_seq_lens = chunk_ends - chunk_starts
                 chunk_seq_lens.clamp_(min=0)  # [num_chunks, num_extends]
                 cu_seq_lens_cpu = torch.zeros(
-                    [num_chunks, num_extends + 1], dtype=torch.int32, pin_memory=True
+                    [num_chunks, num_extends + 1],
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
                 )
                 torch.cumsum(
                     chunk_seq_lens,
