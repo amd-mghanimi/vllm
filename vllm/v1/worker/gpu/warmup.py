@@ -428,6 +428,13 @@ def warmup_kernels(
         if adaptive_sampling:
             assert rejection_sampler is not None
             rejection_sampler.enable_adaptive_verification = True
+    if adaptive_verification is not None:
+        adaptive_verification.warmup_budget_kernel()
+    acceptance_estimator = getattr(
+        model_runner.speculator, "acceptance_estimator", None
+    )
+    if acceptance_estimator is not None:
+        acceptance_estimator.warmup()
     if not model_runner.is_encoder_decoder:
         # A chunked-prefill continuation or prefix-cache hit attends over
         # cached context, which can select attention kernels (e.g. AITER's
@@ -438,13 +445,6 @@ def warmup_kernels(
             worker_sample_tokens,
             model_runner.scheduler_config.max_num_batched_tokens,
         )
-    if adaptive_verification is not None:
-        adaptive_verification.warmup_budget_kernel()
-    acceptance_estimator = getattr(
-        model_runner.speculator, "acceptance_estimator", None
-    )
-    if acceptance_estimator is not None:
-        acceptance_estimator.warmup()
 
 
 def _warmup_kernels(
