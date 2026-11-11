@@ -419,8 +419,86 @@ def test_finalize_is_chunk_invariant() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_dp_flattened_tp_finalize_matches_one_rank(monkeypatch) -> None:
+    """Without EP, MoE TP spans the DP ranks, each holding a partial sum of the
+    DP-gathered tokens. Their outputs, summed by the DP combine, must match one
+    rank that holds the whole sum."""
+    torch.manual_seed(0)
+    sizes = [3, 5]
+    routed = torch.randn(sum(sizes), 2, 8)
+    partials = [routed * 0.25, routed * 0.75]
+    weights = torch.softmax(torch.randn(sum(sizes), 2), dim=-1)
+    ids = torch.zeros(sum(sizes), 2, dtype=torch.int32)
+    module = "vllm.models.muse_spark.amd.muse_moe_runner"
+    monkeypatch.setattr(f"{module}.tensor_model_parallel_all_reduce", lambda x: x)
+    monkeypatch.setattr(f"{module}.get_tensor_model_parallel_world_size", lambda: 1)
+    dp_metadata = SimpleNamespace(get_chunk_sizes_across_dp_rank=lambda: sizes)
+    monkeypatch.setattr(
+        f"{module}.get_forward_context",
+        lambda: SimpleNamespace(dp_metadata=dp_metadata),
+    )
+
+    outputs = []
+    for rank in range(len(sizes)):
+
+        def _reduce_scatterv(x, dim, sizes, rank=rank):
+            assert dim == 0
+            total = sum(p.reshape(x.shape).to(x.dtype) for p in partials)
+            start = sum(sizes[:rank])
+            return total[start : start + sizes[rank]]
+
+        group = SimpleNamespace(rank_in_group=rank, reduce_scatterv=_reduce_scatterv)
+        monkeypatch.setattr(f"{module}.get_dp_group", lambda group=group: group)
+        reducer = MuseSparkTopKWeightAndReduce(
+            _rms_norm, pre_norm_all_reduce=True, dp_reduce_scatter=True
+        )
+        outputs.append(reducer.apply(None, partials[rank], weights, ids, False))
+
+    expected = MuseSparkTopKWeightAndReduce(
+        _rms_norm, pre_norm_all_reduce=False
+    ).apply(None, routed, weights, ids, False)
+    torch.testing.assert_close(sum(outputs), expected)
+
+
+@pytest.mark.parametrize(
+    "tp_size,ep_size,sp_size",
+    # DP2 x TP4: MoE TP8 across DP. DP2 x TP4 + EP: EP8 with SP over TP4.
+    [(8, 1, 1), (1, 8, 4)],
+)
+def test_dp_deployments_are_accepted(tp_size: int, ep_size: int, sp_size: int) -> None:
+    parallel_config = _parallel_config(
+        dp_size=2, tp_size=tp_size, ep_size=ep_size, sp_size=sp_size
+    )
+    validate_mxfp4_deployment(
+        _moe_config(parallel_config=parallel_config, num_experts=8)
+    )
+
+
+@pytest.mark.parametrize(
+    "parallel_config,expanded",
+    [
+        (_parallel_config(tp_size=4), True),
+        (_parallel_config(dp_size=2, tp_size=8), False),
+        (_parallel_config(dp_size=2, ep_size=8, sp_size=4), False),
+    ],
+)
+def test_expanded_expert_input_only_without_dp_dispatch(
+    parallel_config: FusedMoEParallelConfig, expanded: bool
+) -> None:
+    from vllm.models.muse_spark.amd.model import MuseSparkMoE
+
+    routed_experts = SimpleNamespace(
+        moe_config=SimpleNamespace(moe_parallel_config=parallel_config),
+        quant_method=object.__new__(MuseSparkQuarkOCPMXFusedMoE),
+    )
+    moe = SimpleNamespace(
+        pre_expert_norm=SimpleNamespace(variance_size_override=None),
+        experts=SimpleNamespace(routed_experts=routed_experts),
+    )
+    assert MuseSparkMoE._experts_take_expanded_input.func(moe) is expanded
+
+
 _FAIL_CLOSED_EVERYWHERE = [
-    (_moe_config(parallel_config=_parallel_config(dp_size=2)), "DP1"),
     (_moe_config(parallel_config=_parallel_config(pcp_size=2)), "PCP1"),
     (_moe_config(parallel_config=_parallel_config(sp_size=2)), "sequence"),
     (_moe_config(parallel_config=_parallel_config(enable_eplb=True)), "EPLB"),
