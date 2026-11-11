@@ -458,6 +458,15 @@ class AiterFlashAttentionMetadataBuilder(
 
     asm_kv_scale_tables: ClassVar[AsmKvScaleTables] = AsmKvScaleTables()
 
+    # Index tensors that depend only on a batch's CPU lengths. Each KV-cache
+    # group's builder runs build() once per step on the same batch, so the
+    # builders after the first reuse these instead of rebuilding them. Keys are
+    # values, not tensor identity, because the upper-bound buffer is reused in
+    # place every step. Only read-only index tensors are cached; each builder
+    # still allocates its own workspaces.
+    _shared_cache: ClassVar[dict[tuple, dict]] = {}
+    _SHARED_CACHE_MAX_ENTRIES: ClassVar[int] = 2
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -618,6 +627,39 @@ class AiterFlashAttentionMetadataBuilder(
             )
         self.k_scale, self.v_scale = k_scale_tables, v_scale_tables
 
+    def _shared_entry(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_decodes: int,
+        num_extends: int,
+        num_prefills: int,
+        seq_lens: torch.Tensor,
+    ) -> dict:
+        """Cache entry for this batch's extend/prefill rows, created on first use.
+
+        Only the rows at and after num_decodes are read, so only those enter the
+        key. Entries are FIFO-evicted; a hit returns the same dict to every
+        builder that sees identical values this step.
+        """
+        n = common_attn_metadata.num_reqs
+        key = (
+            str(self.device),
+            num_decodes,
+            num_extends,
+            num_prefills,
+            common_attn_metadata.query_start_loc_cpu[num_decodes : n + 1]
+            .numpy()
+            .tobytes(),
+            seq_lens[num_decodes:n].numpy().tobytes(),
+        )
+        cache = AiterFlashAttentionMetadataBuilder._shared_cache
+        entry = cache.get(key)
+        if entry is None:
+            if len(cache) >= self._SHARED_CACHE_MAX_ENTRIES:
+                cache.pop(next(iter(cache)))
+            entry = cache[key] = {}
+        return entry
+
     def build(
         self,
         common_prefix_len: int,
@@ -652,21 +694,37 @@ class AiterFlashAttentionMetadataBuilder(
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
-        kv_sharing_metadata = None
-        if self.kv_sharing_workspace is not None and seq_lens is not None:
-            query_lens = query_lens_cpu[num_decodes:]
-            token_to_batch = torch.repeat_interleave(
-                torch.arange(len(query_lens), dtype=torch.int32, device="cpu"),
-                query_lens,
+        shared = (
+            self._shared_entry(
+                common_attn_metadata,
+                num_decodes,
+                num_extends,
+                num_prefills,
+                seq_lens,
             )
-            query_start_loc = common_attn_metadata.query_start_loc[num_decodes:]
+            if seq_lens is not None
+            else None
+        )
+
+        kv_sharing_metadata = None
+        if self.kv_sharing_workspace is not None and shared is not None:
+            if "kv_sharing" not in shared:
+                query_lens = query_lens_cpu[num_decodes:]
+                token_to_batch = torch.repeat_interleave(
+                    torch.arange(len(query_lens), dtype=torch.int32, device="cpu"),
+                    query_lens,
+                )
+                query_start_loc = common_attn_metadata.query_start_loc[num_decodes:]
+                shared["kv_sharing"] = dict(
+                    query_start_loc=query_start_loc - query_start_loc[0],
+                    token_to_batch=async_tensor_h2d(token_to_batch, self.device),
+                    seq_starts=async_tensor_h2d(
+                        seq_lens[num_decodes:] - query_lens, self.device
+                    ),
+                )
             kv_sharing_metadata = AiterKVSharingMetadata(
                 workspace=self.kv_sharing_workspace,
-                query_start_loc=query_start_loc - query_start_loc[0],
-                token_to_batch=async_tensor_h2d(token_to_batch, self.device),
-                seq_starts=async_tensor_h2d(
-                    seq_lens[num_decodes:] - query_lens, self.device
-                ),
+                **shared["kv_sharing"],
             )
 
         decode_metadata = None
@@ -711,96 +769,123 @@ class AiterFlashAttentionMetadataBuilder(
             computed_kv_lens = seq_lens_for_extend - query_lens_for_extend
             swa_metadata = None
             if self.aot_sliding_window is not None:
-                swa_seqlen_for_extend = torch.minimum(
-                    seq_lens_for_extend,
-                    query_lens_for_extend + self.aot_sliding_window[0] + 1,
+                swa_key = ("swa", self.aot_sliding_window)
+                if swa_key not in shared:
+                    swa_seqlen_for_extend = torch.minimum(
+                        seq_lens_for_extend,
+                        query_lens_for_extend + self.aot_sliding_window[0] + 1,
+                    )
+                    cu_seq_lens = torch.zeros(
+                        num_extends + 1,
+                        dtype=torch.int32,
+                        device=seq_lens_for_extend.device,
+                        pin_memory=True,
+                    )
+                    torch.cumsum(
+                        swa_seqlen_for_extend,
+                        dim=0,
+                        dtype=cu_seq_lens.dtype,
+                        out=cu_seq_lens[1:],
+                    )
+                    token_to_seq = torch.arange(
+                        0,
+                        num_extends,
+                        dtype=torch.int32,
+                        device=seq_lens_for_extend.device,
+                    )
+                    token_to_seq = torch.repeat_interleave(
+                        token_to_seq, swa_seqlen_for_extend
+                    )
+                    seq_starts = seq_lens_for_extend - swa_seqlen_for_extend
+                    shared[swa_key] = dict(
+                        swa_cu_seqlens=cu_seq_lens.to(self.device, non_blocking=True),
+                        swa_seq_starts=async_tensor_h2d(seq_starts, self.device),
+                        swa_token_to_batch=async_tensor_h2d(token_to_seq, self.device),
+                        swa_max_seqlens=swa_seqlen_for_extend.max().item(),
+                        swa_total_tokens=cu_seq_lens[-1].item(),
+                    )
+                swa_index = shared[swa_key]
+                # The scratch buffer is per builder: attention writes into it, so
+                # builders must not alias it. Only the index tensors are shared.
+                # TODO(ganyi): Maybe reuse these 2 buffer from extend_workspace
+                swa_metadata = AiterChunkSlidingWindowMetadata(
+                    **swa_index,
+                    swa_workspace=torch.empty(
+                        (
+                            2,
+                            swa_index["swa_total_tokens"],
+                            self.num_heads_kv,
+                            self.headdim,
+                        ),
+                        dtype=self.vllm_config.model_config.dtype,
+                        device=self.device,
+                    ),
                 )
-                cu_seq_lens = torch.zeros(
-                    num_extends + 1,
-                    dtype=torch.int32,
-                    device=seq_lens_for_extend.device,
-                    pin_memory=True,
+
+            cc_index = shared.get("chunk_context")
+            if cc_index is None:
+                # allocate the equal amount of workspace for
+                # each chunk prefill request
+                max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // num_extends
+                num_chunks = cdiv(computed_kv_lens.max().item(), max_context_chunk)
+
+                chunk_starts = (
+                    torch.arange(num_chunks, dtype=torch.int32)
+                    .unsqueeze(1)
+                    .expand(-1, num_extends)
+                    * max_context_chunk
+                )
+                chunk_ends = torch.min(
+                    computed_kv_lens.unsqueeze(0), chunk_starts + max_context_chunk
+                )
+                chunk_seq_lens = chunk_ends - chunk_starts
+                chunk_seq_lens.clamp_(min=0)  # [num_chunks, num_extends]
+                cu_seq_lens_cpu = torch.zeros(
+                    [num_chunks, num_extends + 1], dtype=torch.int32, pin_memory=True
                 )
                 torch.cumsum(
-                    swa_seqlen_for_extend,
-                    dim=0,
-                    dtype=cu_seq_lens.dtype,
-                    out=cu_seq_lens[1:],
-                )
-                token_to_seq = torch.arange(
-                    0,
-                    num_extends,
+                    chunk_seq_lens,
+                    dim=1,
+                    out=cu_seq_lens_cpu[:, 1:],
                     dtype=torch.int32,
-                    device=seq_lens_for_extend.device,
                 )
-                token_to_seq = torch.repeat_interleave(
-                    token_to_seq, swa_seqlen_for_extend
-                )
-                fetched_shape = cu_seq_lens[-1].item()
-                # TODO(ganyi): Maybe reuse these 2 buffer from extend_workspace
-                swa_workspace = torch.empty(
-                    (2, fetched_shape, self.num_heads_kv, self.headdim),
-                    dtype=self.vllm_config.model_config.dtype,
-                    device=self.device,
+                # Avoid .max() on an empty tensor when there is no context
+                # (num_chunks == 0, e.g. Whisper encoder's first pass).
+                max_cum_tokens = (
+                    cu_seq_lens_cpu[:, -1].max().item() if num_chunks > 0 else 0
                 )
 
-                seq_starts = seq_lens_for_extend - swa_seqlen_for_extend
-                max_seqlen_k = swa_seqlen_for_extend.max().item()
-                total_tokens = cu_seq_lens[-1].item()
+                range_idx = torch.arange(max_cum_tokens, dtype=torch.int32)[
+                    None, None, :
+                ]
+                idx_to_batch_tensor = range_idx == cu_seq_lens_cpu[:, 1:][:, :, None]
+                idx_to_batch_tensor = idx_to_batch_tensor.sum(
+                    dim=1
+                )  # [num_chunks, max_cum_tokens]
+                token_to_batch_tensor = torch.cumsum(idx_to_batch_tensor, dim=1)
 
-                swa_metadata = AiterChunkSlidingWindowMetadata(
-                    swa_cu_seqlens=cu_seq_lens.to(self.device, non_blocking=True),
-                    swa_seq_starts=async_tensor_h2d(seq_starts, self.device),
-                    swa_token_to_batch=async_tensor_h2d(token_to_seq, self.device),
-                    swa_max_seqlens=max_seqlen_k,
-                    swa_total_tokens=total_tokens,
-                    swa_workspace=swa_workspace,
+                cc_index = shared["chunk_context"] = dict(
+                    cu_seq_lens_chunk=cu_seq_lens_cpu.to(
+                        self.device, non_blocking=True
+                    ),
+                    chunk_starts=async_tensor_h2d(chunk_starts, self.device),
+                    token_to_batch=async_tensor_h2d(token_to_batch_tensor, self.device),
+                    max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+                    num_chunks=num_chunks,
+                    total_token_per_batch=cu_seq_lens_cpu[:, -1].tolist(),
                 )
-
-            # allocate the equal amount of workspace for
-            # each chunk prefill request
-            max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // num_extends
-            num_chunks = cdiv(computed_kv_lens.max().item(), max_context_chunk)
-
-            chunk_starts = (
-                torch.arange(num_chunks, dtype=torch.int32)
-                .unsqueeze(1)
-                .expand(-1, num_extends)
-                * max_context_chunk
-            )
-            chunk_ends = torch.min(
-                computed_kv_lens.unsqueeze(0), chunk_starts + max_context_chunk
-            )
-            chunk_seq_lens = chunk_ends - chunk_starts
-            chunk_seq_lens.clamp_(min=0)  # [num_chunks, num_extends]
-            cu_seq_lens_cpu = torch.zeros(
-                [num_chunks, num_extends + 1], dtype=torch.int32, pin_memory=True
-            )
-            torch.cumsum(
-                chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:], dtype=torch.int32
-            )
-            # Avoid .max() on an empty tensor when there is no context
-            # (num_chunks == 0, e.g. Whisper encoder's first pass).
-            max_cum_tokens = (
-                cu_seq_lens_cpu[:, -1].max().item() if num_chunks > 0 else 0
-            )
-
-            range_idx = torch.arange(max_cum_tokens, dtype=torch.int32)[None, None, :]
-            idx_to_batch_tensor = range_idx == cu_seq_lens_cpu[:, 1:][:, :, None]
-            idx_to_batch_tensor = idx_to_batch_tensor.sum(
-                dim=1
-            )  # [num_chunks, max_cum_tokens]
-            token_to_batch_tensor = torch.cumsum(idx_to_batch_tensor, dim=1)
 
             chunk_context_metadata = AiterChunkContextMetadata(
                 workspace=self.extend_workspace,
-                cu_seq_lens_chunk=cu_seq_lens_cpu.to(self.device, non_blocking=True),
-                chunk_starts=async_tensor_h2d(chunk_starts, self.device),
-                token_to_batch=async_tensor_h2d(token_to_batch_tensor, self.device),
-                max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
-                num_chunks=num_chunks,
-                total_token_per_batch=cu_seq_lens_cpu[:, -1].tolist(),
                 swa_metadata=swa_metadata,
+                cu_seq_lens_chunk=cc_index["cu_seq_lens_chunk"],
+                chunk_starts=cc_index["chunk_starts"],
+                token_to_batch=cc_index["token_to_batch"],
+                # Fresh lists per builder: the cached dict must not be mutated
+                # through a builder's metadata.
+                max_seq_lens=list(cc_index["max_seq_lens"]),
+                num_chunks=cc_index["num_chunks"],
+                total_token_per_batch=list(cc_index["total_token_per_batch"]),
             )
 
             query_start_loc_device = common_attn_metadata.query_start_loc[

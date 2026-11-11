@@ -1350,3 +1350,110 @@ def test_aiter_fa_metadata_build_does_not_sync():
     assert metadata.extend_metadata is not None
     assert metadata.prefill_metadata is not None
     assert metadata.prefill_metadata.max_seq_len == 24
+
+
+def test_aiter_fa_build_shares_index_tensors_exactly():
+    """Builders that see the same batch reuse the index tensors, and nothing
+    else: scratch buffers stay per builder, and a sliding window with a
+    different size never reuses the cached sliding-window index."""
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends.rocm_aiter_fa import (
+        AiterFlashAttentionBackend,
+        AiterFlashAttentionMetadataBuilder,
+    )
+
+    _assert_aiter_supported()
+    cache = AiterFlashAttentionMetadataBuilder._shared_cache
+    config = create_vllm_config(
+        model_name="Qwen/Qwen3-0.6B",
+        dtype="bfloat16",
+        max_num_batched_tokens=1024,
+    )
+    num_heads = config.model_config.get_num_attention_heads(config.parallel_config)
+    num_kv_heads = config.model_config.get_num_kv_heads(config.parallel_config)
+    head_size = config.model_config.get_head_size()
+    with set_current_vllm_config(config):
+        Attention(
+            num_heads,
+            head_size,
+            head_size**-0.5,
+            num_kv_heads,
+            cache_config=config.cache_config,
+            prefix="layer",
+            attn_backend=AiterFlashAttentionBackend,
+        )
+        builders = [
+            AiterFlashAttentionMetadataBuilder(
+                create_standard_kv_cache_spec(config),
+                ["layer"],
+                config,
+                torch.device("cuda"),
+            )
+            for _ in range(3)
+        ]
+    # The stock test model enables neither path; set them directly.
+    for builder, window in zip(builders, [(255, 0), (255, 0), (15, 0)]):
+        builder.aot_sliding_window = window
+        builder.kv_sharing_workspace = torch.empty(
+            (2, 4096, num_kv_heads, head_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+    # One extend row and one prefill row. Decode rows would take the sliding
+    # window decode path, which needs the builder's persistent tables.
+    batch_spec = BatchSpec(seq_lens=[80, 24], query_lens=[32, 24])
+    common = create_common_attn_metadata(
+        batch_spec, BLOCK_SIZE, torch.device("cuda"), max_block_idx=32
+    )
+
+    cache.clear()
+    first = builders[0].build(0, common)
+    second = builders[1].build(0, common)
+    assert len(cache) == 1, "same batch and window should form one cache entry"
+
+    # Shared: the index tensors are the same objects.
+    kv1, kv2 = first.kv_sharing_metadata, second.kv_sharing_metadata
+    cc1 = first.extend_metadata.chunk_context_metadata
+    cc2 = second.extend_metadata.chunk_context_metadata
+    assert kv2.token_to_batch is kv1.token_to_batch
+    assert cc2.token_to_batch is cc1.token_to_batch
+    assert cc2.swa_metadata.swa_cu_seqlens is cc1.swa_metadata.swa_cu_seqlens
+
+    # Not shared: each builder's workspaces.
+    assert kv2.workspace is builders[1].kv_sharing_workspace
+    assert cc2.workspace is builders[1].extend_workspace
+    assert cc2.swa_metadata.swa_workspace is not cc1.swa_metadata.swa_workspace
+
+    # Exact: a rebuild with the cache cleared gives equal index tensors.
+    cache.clear()
+    fresh = builders[1].build(0, common)
+    kvf = fresh.kv_sharing_metadata
+    ccf = fresh.extend_metadata.chunk_context_metadata
+    assert kvf.token_to_batch is not kv2.token_to_batch
+    for got, want in [
+        (kv2.token_to_batch, kvf.token_to_batch),
+        (kv2.seq_starts, kvf.seq_starts),
+        (kv2.query_start_loc, kvf.query_start_loc),
+        (cc2.cu_seq_lens_chunk, ccf.cu_seq_lens_chunk),
+        (cc2.chunk_starts, ccf.chunk_starts),
+        (cc2.token_to_batch, ccf.token_to_batch),
+        (cc2.swa_metadata.swa_cu_seqlens, ccf.swa_metadata.swa_cu_seqlens),
+        (cc2.swa_metadata.swa_seq_starts, ccf.swa_metadata.swa_seq_starts),
+        (cc2.swa_metadata.swa_token_to_batch, ccf.swa_metadata.swa_token_to_batch),
+    ]:
+        assert torch.equal(got, want)
+    assert cc2.max_seq_lens == ccf.max_seq_lens
+    assert cc2.total_token_per_batch == ccf.total_token_per_batch
+    assert cc2.num_chunks == ccf.num_chunks
+
+    # A different window must not reuse the cached sliding-window index.
+    third = builders[2].build(0, common)
+    swa3 = third.extend_metadata.chunk_context_metadata.swa_metadata
+    assert swa3.swa_total_tokens != cc1.swa_metadata.swa_total_tokens
