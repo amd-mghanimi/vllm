@@ -830,7 +830,7 @@ class AiterFlashAttentionMetadataBuilder(
                 num_chunks = cdiv(computed_kv_lens.max().item(), max_context_chunk)
 
                 chunk_starts = (
-                    torch.arange(num_chunks, dtype=torch.int32)
+                    torch.arange(num_chunks, dtype=torch.int32, device="cpu")
                     .unsqueeze(1)
                     .expand(-1, num_extends)
                     * max_context_chunk
@@ -855,9 +855,9 @@ class AiterFlashAttentionMetadataBuilder(
                     cu_seq_lens_cpu[:, -1].max().item() if num_chunks > 0 else 0
                 )
 
-                range_idx = torch.arange(max_cum_tokens, dtype=torch.int32)[
-                    None, None, :
-                ]
+                range_idx = torch.arange(
+                    max_cum_tokens, dtype=torch.int32, device="cpu"
+                )[None, None, :]
                 idx_to_batch_tensor = range_idx == cu_seq_lens_cpu[:, 1:][:, :, None]
                 idx_to_batch_tensor = idx_to_batch_tensor.sum(
                     dim=1
