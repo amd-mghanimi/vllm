@@ -227,6 +227,18 @@ def _gathered_column_proj(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return _all_gather_columns(out)
 
 
+def _token_sharded_residual_stream(vllm_config: VllmConfig) -> bool:
+    """Whether the residual stream may be split by token across the TP ranks.
+
+    #63085 does that for large forwards and does not set
+    ``use_sequence_parallel_moe``, which is the only sequence-parallel check
+    in :func:`_can_shard_projections`. The helper is added to this module by
+    that change; until then the stream is not sharded.
+    """
+    fn = globals().get("token_sharded_stream_supported")
+    return fn is not None and fn(vllm_config)
+
+
 def _can_shard_projections(
     vllm_config: VllmConfig, tp_size: int, is_sequence_parallel: bool
 ) -> bool:
@@ -235,10 +247,13 @@ def _can_shard_projections(
     That needs the same tokens, in the same order, on every TP rank. The
     split-K GEMM picks its config by token count, so it is not batch
     invariant. The decode monokernel slices its rows out of the full weights.
+    A token-sharded residual stream gives each rank different tokens, so the
+    column shard stays off while that stream can run.
     """
     return (
         tp_size > 1
         and not is_sequence_parallel
+        and not _token_sharded_residual_stream(vllm_config)
         and vllm_config.parallel_config.data_parallel_size == 1
         and not envs.VLLM_BATCH_INVARIANT
         and not vllm_config.kernel_config.monokernel
