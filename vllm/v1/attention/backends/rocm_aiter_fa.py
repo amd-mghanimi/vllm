@@ -48,6 +48,7 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 def _end_extends_at_last_context_row(
     query_start_loc_cpu: torch.Tensor,
     seq_lens_cpu_upper_bound: torch.Tensor | None,
+    num_reqs: int,
     num_decodes: int,
     num_extends: int,
     num_prefills: int,
@@ -67,7 +68,7 @@ def _end_extends_at_last_context_row(
     if seq_lens_cpu_upper_bound is None:
         return num_extends, num_prefills, num_extend_tokens, num_extends
     start = num_decodes
-    end = num_decodes + num_extends + num_prefills
+    end = num_reqs
     query_lens = (
         query_start_loc_cpu[start + 1 : end + 1] - query_start_loc_cpu[start:end]
     )
@@ -694,6 +695,7 @@ class AiterFlashAttentionMetadataBuilder(
             ) = _end_extends_at_last_context_row(
                 query_start_loc_cpu,
                 common_attn_metadata.seq_lens_cpu_upper_bound,
+                common_attn_metadata.num_reqs,
                 num_decodes,
                 num_extends,
                 num_prefills,
