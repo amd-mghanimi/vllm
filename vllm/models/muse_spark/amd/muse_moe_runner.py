@@ -70,6 +70,7 @@ from vllm.models.muse_spark.amd.staged_moe import (
     ColumnShardedDownWeights,
     ColumnShardedRoutes,
     all_gather_columns,
+    column_shard_group,
     column_sharded_down_supported,
     staged_fused_moe,
     staged_moe_supported,
@@ -253,9 +254,15 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
         if self.take_route_output is not None:
             route_output = self.take_route_output()
             if isinstance(route_output, ColumnShardedRoutes):
-                return self._column_sharded_finalize(
+                finalized = self._column_sharded_finalize(
                     route_output.routes, topk_weights, output
                 )
+                if self.dp_reduce_scatter:
+                    # Every rank holds the full hidden state of every DP
+                    # rank's tokens. Keep this rank's rows so the DP combine
+                    # reduce-scatter returns them unchanged.
+                    self._zero_other_dp_rows(finalized)
+                return finalized
             if route_output is not None:
                 fused_expert_output = route_output
         num_tokens, top_k = topk_ids.shape
@@ -380,6 +387,19 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
         output.zero_()
         return local, topk_weights[own], output[own]
 
+    def _zero_other_dp_rows(self, output: torch.Tensor) -> None:
+        """Zero every DP rank's tokens but this one."""
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+        start = sum(sizes[: get_dp_group().rank_in_group])
+        end = start + sizes[get_dp_group().rank_in_group]
+        if start:
+            output[:start].zero_()
+        if end < output.shape[0]:
+            output[end:].zero_()
+
     def _column_sharded_finalize(
         self,
         routes: torch.Tensor,
@@ -388,19 +408,19 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
     ) -> torch.Tensor:
         """Finalize routes held as column shards `[T, top_k, H / tp]` (see
         `staged_moe`): all-reduce each route's sum of squares,
-        normalize and weight-sum the local columns, then all-gather them."""
+        normalize and weight-sum the local columns, then all-gather them.
+        `tp` is the MoE TP size, flattened across DP when EP is off."""
         norm = self.fused_norm
         assert norm is not None
         num_tokens, _, cols = routes.shape
-        tp_size = get_tensor_model_parallel_world_size()
-        rank = get_tensor_model_parallel_rank()
+        group, tp_size, rank = column_shard_group()
         weight = (
             norm.weight[rank * cols : (rank + 1) * cols] if norm.has_weight else None
         )
         sum_squares = route_sum_squares(
             routes, weight, norm.fused_gain_center, norm.applies_weight_before_norm
         )
-        sum_squares = tensor_model_parallel_all_reduce(sum_squares)
+        sum_squares = group.all_reduce(sum_squares)
         if output is None:
             output = routes.new_empty((num_tokens, cols * tp_size))
         local = routes.new_empty((num_tokens, cols), dtype=output.dtype)

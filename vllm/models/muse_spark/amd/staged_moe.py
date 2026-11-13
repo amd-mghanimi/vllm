@@ -12,16 +12,18 @@ The post-expert RMSNorm is per route, so the experts must return the unreduced
   kernels are the ones AITER selects for the repeated-input call
   (`config_shape`), so the route outputs are unchanged. Under EP, routes to
   experts this rank does not own are left unwritten.
-* at TP > 1, for large eager batches, also runs stage 2 column-sharded: it
-  all-gathers stage 2's MXFP4 input and E8M0 scales along the intermediate dim
-  (each rank's slice is whole 32-element quant groups, so the gathered tensors
-  are exactly the full-width quantization) and multiplies them by a second
-  copy of `w2` that holds this rank's `H / tp` output rows. That gives
+* at MoE TP > 1, for large eager batches, also runs stage 2 column-sharded:
+  it all-gathers stage 2's MXFP4 input and E8M0 scales along the intermediate
+  dim (each rank's slice is whole 32-element quant groups, so the gathered
+  tensors are exactly the full-width quantization) and multiplies them by a
+  second copy of `w2` that holds this rank's `H / tp` output rows. That gives
   every route's exact output on those columns, so the post-expert norm needs
   only a `[T, top_k]` sum-of-squares all-reduce and an all-gather of the
   finalized columns (see `ops/column_sharded_finalize.py`) instead of a
   reduce-scatter of `[T, top_k, H]` partial sums. The second `w2` is as
-  large as the rank's regular `w2` shard.
+  large as the rank's regular `w2` shard. With data parallelism and no expert
+  parallelism, MoE TP is flattened across DP×TP, so those collectives run on
+  that group rather than the attention TP group.
 """
 
 import inspect
@@ -32,9 +34,9 @@ import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
+    GroupCoordinator,
+    get_ep_group,
     get_tp_group,
-    tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -135,13 +137,32 @@ def staged_moe_supported(
     )
 
 
+def column_shard_group() -> tuple[GroupCoordinator, int, int]:
+    """Group, world size and rank that shard one expert's intermediate dim.
+
+    That is the attention TP group, except when MoE TP is flattened across
+    DP×PCP (`FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp`). The
+    flattened ranks are the expert-parallel group, in the same order.
+    """
+    tp = get_tp_group()
+    ep = get_ep_group()
+    # The EP group spans DP x PCP x TP, so it equals the TP group exactly when
+    # DP and PCP are both 1. No config lookup here: this runs in forward.
+    if ep.world_size == tp.world_size:
+        return tp, tp.world_size, tp.rank_in_group
+    return ep, ep.world_size, ep.rank_in_group
+
+
 def column_sharded_down_supported(moe_config: FusedMoEConfig) -> bool:
-    """Whether this MXFP4 layer builds the column-sharded down projection."""
+    """Whether this MXFP4 layer builds the column-sharded down projection.
+
+    `tp_size` is the MoE TP size, already flattened across DP when expert
+    parallelism is off. The gathers run on `column_shard_group()`.
+    """
     parallel_config = moe_config.moe_parallel_config
     tp_size = parallel_config.tp_size
     return (
         tp_size > 1
-        and parallel_config.dp_size == 1
         and not parallel_config.use_ep
         and moe_config.activation == MoEActivation.SILU
         and not moe_config.has_bias
@@ -160,14 +181,14 @@ def _all_to_all_rows(x: torch.Tensor) -> torch.Tensor:
     """`[E, H, c]` intermediate slice of every row -> `[E, H / tp, tp * c]`
     full intermediate dim of this rank's rows (bytes)."""
     x = x.view(torch.uint8)
-    tp_size = get_tensor_model_parallel_world_size()
+    group, tp_size, _ = column_shard_group()
     num_experts, rows, cols = x.shape
     rows_per_rank = rows // tp_size
     send = (
         x.view(num_experts, tp_size, rows_per_rank, cols).transpose(0, 1).contiguous()
     )
     recv = torch.empty_like(send)
-    torch.distributed.all_to_all_single(recv, send, group=get_tp_group().device_group)
+    torch.distributed.all_to_all_single(recv, send, group=group.device_group)
     # recv[r] is rank r's intermediate slice of this rank's rows.
     return recv.permute(1, 2, 0, 3).reshape(num_experts, rows_per_rank, -1)
 
@@ -216,10 +237,12 @@ class ColumnShardedRoutes:
 def all_gather_columns(
     x: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """All-gather TP shards `[n, c]` along columns into `[n, tp * c]`
-    (written into `out` when given): AITER's all-gather in row chunks that
-    fit its IPC buffer, else RCCL. Eager only."""
-    comm = getattr(get_tp_group().device_communicator, "aiter_ar_comm", None)
+    """All-gather column shards `[n, c]` into `[n, tp * c]` (written into
+    `out` when given): AITER's all-gather in row chunks that fit its IPC
+    buffer, else RCCL. The group is `column_shard_group()`. Eager only."""
+    group, _, _ = column_shard_group()
+    communicator = group.device_communicator
+    comm = getattr(communicator, "aiter_ar_comm", None) if communicator else None
     if comm is not None and not comm.disabled and x.is_contiguous():
         ca = comm.aiter_ca
         row_bytes = x.shape[1] * x.element_size()
@@ -232,7 +255,7 @@ def all_gather_columns(
                 end = min(start + rows, x.shape[0])
                 ca.all_gather_unreg(x[start:end], out=out[start:end], dim=-1)
             return out
-    gathered = tensor_model_parallel_all_gather(x, dim=-1)
+    gathered = group.all_gather(x, dim=-1)
     return gathered if out is None else out.copy_(gathered)
 
 
