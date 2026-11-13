@@ -895,6 +895,10 @@ def split_decodes_prefills_and_extends(
 
     query_lens = query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
     is_decode = query_lens <= decode_threshold
+    # max_query_len can overstate, so argmin below would report 0 decodes here.
+    if bool(is_decode.all()):
+        return num_reqs, 0, 0, num_tokens, 0, 0
+
     # Only the leading run: MRV1 places short new prompts at the end.
     num_decodes = int(is_decode.int().argmin().item())
 
