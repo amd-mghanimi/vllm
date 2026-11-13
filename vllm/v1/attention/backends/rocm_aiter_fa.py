@@ -43,6 +43,49 @@ from vllm.v1.kv_cache_interface import (
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+
+
+def _end_extends_at_last_context_row(
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu_upper_bound: torch.Tensor | None,
+    num_reqs: int,
+    num_decodes: int,
+    num_extends: int,
+    num_prefills: int,
+    num_extend_tokens: int,
+) -> tuple[int, int, int]:
+    """Move rows with KV context out of the prefill region.
+
+    The prefill kernel attends only to the tokens of this step, so a row with
+    context must go through the extend path. The shared splitter starts the
+    prefills at the first row without context, which assumes every row with
+    context sorts ahead of it; the model runner does not guarantee that order.
+    The extend path handles a row without context, so the extends end at the
+    last row that has context instead.
+
+    Returns (num_extends, num_prefills, num_extend_tokens).
+    """
+    if seq_lens_cpu_upper_bound is None:
+        return num_extends, num_prefills, num_extend_tokens
+    start = num_decodes
+    end = num_reqs
+    query_lens = (
+        query_start_loc_cpu[start + 1 : end + 1] - query_start_loc_cpu[start:end]
+    )
+    # The upper bound is exact for rows without context, so this never marks
+    # a fresh prompt as having context.
+    has_context = seq_lens_cpu_upper_bound[start:end] > query_lens
+    context_rows = has_context.nonzero()
+    first_prefill = start + num_extends
+    if context_rows.numel() > 0:
+        first_prefill = max(first_prefill, start + int(context_rows[-1]) + 1)
+    num_extends = first_prefill - start
+    num_extend_tokens = int(
+        query_start_loc_cpu[first_prefill] - query_start_loc_cpu[start]
+    )
+    return num_extends, end - first_prefill, num_extend_tokens
+
+
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
@@ -641,6 +684,20 @@ class AiterFlashAttentionMetadataBuilder(
         ) = split_ret
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        if num_extends > 0 or num_prefills > 0:
+            (
+                num_extends,
+                num_prefills,
+                num_extend_tokens,
+            ) = _end_extends_at_last_context_row(
+                query_start_loc_cpu,
+                common_attn_metadata.seq_lens_cpu_upper_bound,
+                common_attn_metadata.num_reqs,
+                num_decodes,
+                num_extends,
+                num_prefills,
+                num_extend_tokens,
+            )
 
         with gpu_sync_allowed():
             # Only copy seq_lens to CPU when prefill or extend is present to avoid a
