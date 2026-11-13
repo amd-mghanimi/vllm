@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    split_decodes_and_prefills,
+    split_decodes_prefills_and_extends,
+)
+from vllm.v1.worker.cp_utils import (
+    should_split_fa2_dcp_context_attention,
+    split_dcp_context_queries,
+)
 
 
 def apply_split_decodes_and_prefills(
@@ -162,3 +170,81 @@ def test_split_decodes_and_prefills_uniform_padded_batch_all_same():
     assert num_prefills == 0
     assert num_decode_tokens == padded_num_tokens
     assert num_prefill_tokens == 0
+
+
+def apply_split_decodes_prefills_and_extends(
+    query_lens: list[int],
+    seq_lens: list[int],
+    decode_threshold: int,
+    max_query_len: int | None = None,
+):
+    common_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    if max_query_len is not None:
+        common_metadata.max_query_len = max_query_len
+    return split_decodes_prefills_and_extends(
+        common_metadata, decode_threshold=decode_threshold
+    )
+
+
+# Every row is at or under the threshold and has context behind it. Adaptive
+# verification passes max_query_len as an upper bound (1 + num_speculative_tokens)
+# while the host query lengths are already trimmed, so it can exceed the threshold.
+@pytest.mark.parametrize(
+    "query_lens,decode_threshold,max_query_len",
+    [
+        ([1, 1, 1], 1, 5),
+        ([1, 1, 1], 1, 8),
+        ([1, 3, 5], 5, 9),
+    ],
+)
+def test_split_decodes_prefills_and_extends_overstated_max_query_len(
+    query_lens: list[int], decode_threshold: int, max_query_len: int
+):
+    seq_lens = [30, 40, 50]
+    result = apply_split_decodes_prefills_and_extends(
+        query_lens, seq_lens, decode_threshold, max_query_len
+    )
+    exact = apply_split_decodes_prefills_and_extends(
+        query_lens, seq_lens, decode_threshold
+    )
+    assert result == (3, 0, 0, sum(query_lens), 0, 0)
+    assert result == exact
+
+
+def test_split_decodes_prefills_and_extends_overstated_mixed_batch():
+    # A decode, an extend and a fresh prefill: the guard must not move them.
+    query_lens = [1, 16, 64]
+    seq_lens = [20, 100, 64]
+    result = apply_split_decodes_prefills_and_extends(
+        query_lens, seq_lens, decode_threshold=1, max_query_len=128
+    )
+    assert result == (1, 1, 1, 1, 16, 64)
+
+
+def test_split_dcp_context_queries_overstated_all_decode():
+    # FlashAttention's DCP path splits at threshold 1. An empty split here
+    # makes the FA2 path skip context attention for every row.
+    query_start_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    seq_lens = torch.tensor([30, 40, 50], dtype=torch.int32)
+    num_decodes, num_extends, num_decode_tokens, num_extend_tokens = (
+        split_dcp_context_queries(
+            query_start_loc, seq_lens, max_query_len=5, num_actual_tokens=3
+        )
+    )
+    assert (num_decodes, num_extends, num_decode_tokens, num_extend_tokens) == (
+        3,
+        0,
+        3,
+        0,
+    )
+    assert not should_split_fa2_dcp_context_attention(
+        fa_version=2,
+        max_query_len=5,
+        num_reqs=3,
+        num_decode_reqs=num_decodes,
+        num_context_prefill_reqs=num_extends,
+    )
