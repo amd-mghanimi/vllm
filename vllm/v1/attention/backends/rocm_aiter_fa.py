@@ -760,7 +760,10 @@ class AiterFlashAttentionMetadataBuilder(
 
             # allocate the equal amount of workspace for
             # each chunk prefill request
-            max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // num_extends
+            # Rows without context gather nothing, so only rows with context
+            # share the workspace.
+            num_context_extends = max(1, int((computed_kv_lens > 0).sum()))
+            max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // num_context_extends
             num_chunks = cdiv(computed_kv_lens.max().item(), max_context_chunk)
 
             chunk_starts = (
