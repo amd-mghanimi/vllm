@@ -53,7 +53,7 @@ def _end_extends_at_last_context_row(
     num_extends: int,
     num_prefills: int,
     num_extend_tokens: int,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int]:
     """Move rows with KV context out of the prefill region.
 
     The prefill kernel attends only to the tokens of this step, so a row with
@@ -63,10 +63,10 @@ def _end_extends_at_last_context_row(
     The extend path handles a row without context, so the extends end at the
     last row that has context instead.
 
-    Returns (num_extends, num_prefills, num_extend_tokens, num_context_extends).
+    Returns (num_extends, num_prefills, num_extend_tokens).
     """
     if seq_lens_cpu_upper_bound is None:
-        return num_extends, num_prefills, num_extend_tokens, num_extends
+        return num_extends, num_prefills, num_extend_tokens
     start = num_decodes
     end = num_reqs
     query_lens = (
@@ -83,8 +83,7 @@ def _end_extends_at_last_context_row(
     num_extend_tokens = int(
         query_start_loc_cpu[first_prefill] - query_start_loc_cpu[start]
     )
-    num_context_extends = int(has_context[:num_extends].sum())
-    return num_extends, end - first_prefill, num_extend_tokens, num_context_extends
+    return num_extends, end - first_prefill, num_extend_tokens
 
 
 if current_platform.is_rocm():
@@ -685,13 +684,11 @@ class AiterFlashAttentionMetadataBuilder(
         ) = split_ret
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        num_context_extends = num_extends
         if num_extends > 0 or num_prefills > 0:
             (
                 num_extends,
                 num_prefills,
                 num_extend_tokens,
-                num_context_extends,
             ) = _end_extends_at_last_context_row(
                 query_start_loc_cpu,
                 common_attn_metadata.seq_lens_cpu_upper_bound,
@@ -820,9 +817,7 @@ class AiterFlashAttentionMetadataBuilder(
 
             # allocate the equal amount of workspace for
             # each chunk prefill request
-            # Rows without context gather nothing, so only rows with context
-            # share the workspace.
-            max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // max(1, num_context_extends)
+            max_context_chunk = _CP_TOKENS_PER_ITER_ROCM // num_extends
             num_chunks = cdiv(computed_kv_lens.max().item(), max_context_chunk)
 
             chunk_starts = (
