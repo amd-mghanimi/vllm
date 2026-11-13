@@ -520,9 +520,14 @@ class MuseSparkMoE(nn.Module):
     def _experts_take_expanded_input(self) -> bool:
         """Whether the experts consume one input row per route (AITER MXFP4)."""
         norm = self.pre_expert_norm
+        parallel_config = self.experts.routed_experts.moe_config.moe_parallel_config
         return (
             norm is not None
             and norm.variance_size_override is None
+            # A DP or SP dispatch gathers the input into a new buffer, which
+            # neither carries the expanded routes nor accepts a strided view.
+            and parallel_config.dp_size == 1
+            and not parallel_config.is_sequence_parallel
             and isinstance(
                 self.experts.routed_experts.quant_method, MuseSparkQuarkOCPMXFusedMoE
             )

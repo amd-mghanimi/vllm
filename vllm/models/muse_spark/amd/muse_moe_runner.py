@@ -14,6 +14,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
+    get_dp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -21,6 +22,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -68,6 +70,7 @@ from vllm.models.muse_spark.amd.staged_moe import (
     ColumnShardedDownWeights,
     ColumnShardedRoutes,
     all_gather_columns,
+    column_shard_group,
     column_sharded_down_supported,
     staged_fused_moe,
     staged_moe_supported,
@@ -113,17 +116,27 @@ def token_sharded_moe_output() -> Iterator[None]:
         _token_sharded_output = previous
 
 
+def _tp_spans_dp(moe_config: FusedMoEConfig) -> bool:
+    """Whether the MoE TP group is flattened across DP ranks (DP > 1 without
+    EP), so each rank holds a partial sum of DP-gathered tokens."""
+    parallel_config = moe_config.moe_parallel_config
+    return parallel_config.dp_size > 1 and not parallel_config.use_ep
+
+
 def _validate_tp_post_norm_deployment(
     moe_config: FusedMoEConfig, precision: str
 ) -> None:
     parallel_config = moe_config.moe_parallel_config
-    if parallel_config.dp_size != 1 or parallel_config.pcp_size != 1:
+    if parallel_config.pcp_size != 1:
         raise NotImplementedError(
-            f"Muse Spark {precision} on ROCm currently requires DP1 and PCP1."
+            f"Muse Spark {precision} on ROCm currently requires PCP1."
         )
-    if parallel_config.is_sequence_parallel:
+    if parallel_config.is_sequence_parallel and not parallel_config.use_ep:
+        # Under EP each route is finalized whole on its owner rank, so the
+        # SP combine after the norm stays linear; TP-sharded routes are not.
         raise NotImplementedError(
-            f"Muse Spark {precision} on ROCm does not support sequence-parallel MoE."
+            f"Muse Spark {precision} on ROCm supports sequence-parallel MoE only "
+            "with expert parallelism."
         )
     if moe_config.is_lora_enabled:
         raise NotImplementedError(
@@ -197,12 +210,14 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
         post_expert_norm_fn: Callable[..., torch.Tensor],
         *,
         pre_norm_all_reduce: bool,
+        dp_reduce_scatter: bool = False,
         take_route_output: Callable[[], torch.Tensor | ColumnShardedRoutes | None]
         | None = None,
         take_route_expert_map: Callable[[], torch.Tensor | None] | None = None,
     ) -> None:
         self.post_expert_norm_fn = post_expert_norm_fn
         self.pre_norm_all_reduce = pre_norm_all_reduce
+        self.dp_reduce_scatter = dp_reduce_scatter
         self.take_route_output = take_route_output
         self.take_route_expert_map = take_route_expert_map
         self.reduce_dtype = (
@@ -239,9 +254,15 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
         if self.take_route_output is not None:
             route_output = self.take_route_output()
             if isinstance(route_output, ColumnShardedRoutes):
-                return self._column_sharded_finalize(
+                finalized = self._column_sharded_finalize(
                     route_output.routes, topk_weights, output
                 )
+                if self.dp_reduce_scatter:
+                    # Every rank holds the full hidden state of every DP
+                    # rank's tokens. Keep this rank's rows so the DP combine
+                    # reduce-scatter returns them unchanged.
+                    self._zero_other_dp_rows(finalized)
+                return finalized
             if route_output is not None:
                 fused_expert_output = route_output
         num_tokens, top_k = topk_ids.shape
@@ -280,6 +301,13 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
                 gather=False,
             )
             return output
+
+        full_output = output
+        if self.dp_reduce_scatter:
+            routed, topk_weights, output = self._dp_reduce_scatter(
+                routed, topk_weights, output
+            )
+            num_tokens = routed.shape[0]
 
         token_sharded = (
             self.pre_norm_all_reduce
@@ -329,7 +357,48 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
             normalized.mul_(topk_weights[tail:end].float().unsqueeze(-1))
             output[tail:end].copy_(normalized.sum(dim=1).to(output.dtype))
 
-        return output
+        return full_output
+
+    def _dp_reduce_scatter(
+        self,
+        routed: torch.Tensor,
+        topk_weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sum the DP ranks' partial routes of this rank's own tokens.
+
+        The rows left are partial over the TP group only, as without DP. The
+        other DP ranks' tokens are zeroed in `output`, so the DP combine that
+        follows returns this rank's tokens unchanged.
+        """
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+        dp_group = get_dp_group()
+        start = sum(sizes[: dp_group.rank_in_group])
+        num_tokens, top_k, hidden_dim = routed.shape
+        local = dp_group.reduce_scatterv(
+            routed.reshape(num_tokens, top_k * hidden_dim).to(self.reduce_dtype),
+            dim=0,
+            sizes=sizes,
+        ).view(-1, top_k, hidden_dim)
+        own = slice(start, start + local.shape[0])
+        output.zero_()
+        return local, topk_weights[own], output[own]
+
+    def _zero_other_dp_rows(self, output: torch.Tensor) -> None:
+        """Zero every DP rank's tokens but this one."""
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+        start = sum(sizes[: get_dp_group().rank_in_group])
+        end = start + sizes[get_dp_group().rank_in_group]
+        if start:
+            output[:start].zero_()
+        if end < output.shape[0]:
+            output[end:].zero_()
 
     def _column_sharded_finalize(
         self,
@@ -339,19 +408,19 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
     ) -> torch.Tensor:
         """Finalize routes held as column shards `[T, top_k, H / tp]` (see
         `staged_moe`): all-reduce each route's sum of squares,
-        normalize and weight-sum the local columns, then all-gather them."""
+        normalize and weight-sum the local columns, then all-gather them.
+        `tp` is the MoE TP size, flattened across DP when EP is off."""
         norm = self.fused_norm
         assert norm is not None
         num_tokens, _, cols = routes.shape
-        tp_size = get_tensor_model_parallel_world_size()
-        rank = get_tensor_model_parallel_rank()
+        group, tp_size, rank = column_shard_group()
         weight = (
             norm.weight[rank * cols : (rank + 1) * cols] if norm.has_weight else None
         )
         sum_squares = route_sum_squares(
             routes, weight, norm.fused_gain_center, norm.applies_weight_before_norm
         )
-        sum_squares = tensor_model_parallel_all_reduce(sum_squares)
+        sum_squares = group.all_reduce(sum_squares)
         if output is None:
             output = routes.new_empty((num_tokens, cols * tp_size))
         local = routes.new_empty((num_tokens, cols), dtype=output.dtype)
@@ -516,6 +585,7 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
         return MuseSparkTopKWeightAndReduce(
             quant_config.post_expert_norm_fn,
             pre_norm_all_reduce=self.moe_config.moe_parallel_config.tp_size > 1,
+            dp_reduce_scatter=_tp_spans_dp(self.moe_config),
             take_route_output=self._take_route_output,
             take_route_expert_map=self._take_route_expert_map,
         )
@@ -773,6 +843,7 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
         return MuseSparkTopKWeightAndReduce(
             quant_config.post_expert_norm_fn,
             pre_norm_all_reduce=self.moe_config.moe_parallel_config.tp_size > 1,
+            dp_reduce_scatter=_tp_spans_dp(self.moe_config),
             take_route_output=self._take_route_output,
             take_route_expert_map=self._take_route_expert_map,
         )

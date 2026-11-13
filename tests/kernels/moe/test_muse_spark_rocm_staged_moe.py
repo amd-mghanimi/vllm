@@ -60,16 +60,21 @@ def _moe_config(
     *,
     tp_size: int = WORLD,
     ep_size: int = 1,
+    dp_size: int = 1,
     hidden_dim: int = HIDDEN,
     intermediate_size: int = INTERMEDIATE,
     activation: MoEActivation = MoEActivation.SILU,
     device: str = "cpu",
 ) -> FusedMoEConfig:
-    """Rank 0's MoE config; under EP the MoE runs at tp_size 1."""
+    """Rank 0's MoE config; under EP the MoE runs at tp_size 1.
+
+    `tp_size` is the MoE TP size. DP without EP flattens it, so DP2×TP4
+    is `tp_size=8, dp_size=2`.
+    """
     parallel_config = FusedMoEParallelConfig(
         tp_size=tp_size,
         pcp_size=1,
-        dp_size=1,
+        dp_size=dp_size,
         ep_size=ep_size,
         tp_rank=0,
         pcp_rank=0,
@@ -102,6 +107,8 @@ def _moe_config(
         ({}, True),
         ({"tp_size": 2}, True),
         ({"tp_size": 1}, False),
+        # DP2 x TP4: MoE TP is flattened to 8, and the column gathers cover it.
+        ({"tp_size": 8, "dp_size": 2}, True),
         ({"tp_size": 1, "ep_size": 8}, False),
         ({"tp_size": 8, "ep_size": 8}, False),
         ({"hidden_dim": 3072}, False),
