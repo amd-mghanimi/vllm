@@ -899,7 +899,8 @@ def split_decodes_prefills_and_extends(
     num_decodes = first_extend
     num_decode_tokens = query_start_loc[first_extend].item()
     if not torch.any(is_prefill_or_extend):
-        return (num_decodes, 0, 0, num_decode_tokens, 0, 0)
+        # max_query_len can overstate; every row is then a decode.
+        return (num_reqs, 0, 0, num_tokens, 0, 0)
 
     num_prefills_or_extends = num_reqs - num_decodes
     num_prefill_or_extend_tokens = num_tokens - num_decode_tokens
