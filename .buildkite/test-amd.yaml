@@ -2221,6 +2221,7 @@ steps:
     --ignore=v1/attention/test_gdn_aiter_flydsl.py
     --ignore=v1/attention/test_mla_backends.py
     --ignore=v1/attention/test_sparse_mla_backends.py
+    --ignore=v1/attention/test_rocm_aiter_fa_extend_warmup.py
     --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
 
   - >-
@@ -5985,6 +5986,7 @@ steps:
     --ignore=v1/attention/test_gdn_aiter_flydsl.py
     --ignore=v1/attention/test_mla_backends.py
     --ignore=v1/attention/test_sparse_mla_backends.py
+    --ignore=v1/attention/test_rocm_aiter_fa_extend_warmup.py
     --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
   - >-
     VLLM_ROCM_USE_AITER=1 pytest -v -s

@@ -47,6 +47,7 @@ steps:
         --ignore=v1/attention/test_gdn_aiter_flydsl.py
         --ignore=v1/attention/test_mla_backends.py
         --ignore=v1/attention/test_sparse_mla_backends.py
+        --ignore=v1/attention/test_rocm_aiter_fa_extend_warmup.py
       - >-
         VLLM_ROCM_USE_AITER=1 pytest -v -s
         v1/attention/test_gdn_aiter_flydsl.py
@@ -110,6 +111,7 @@ steps:
         --ignore=v1/attention/test_gdn_aiter_flydsl.py
         --ignore=v1/attention/test_mla_backends.py
         --ignore=v1/attention/test_sparse_mla_backends.py
+        --ignore=v1/attention/test_rocm_aiter_fa_extend_warmup.py
       - >-
         VLLM_ROCM_USE_AITER=1 pytest -v -s
         v1/attention/test_gdn_aiter_flydsl.py
