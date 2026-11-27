@@ -349,6 +349,7 @@ class MuseSparkMoE(nn.Module):
         )
 
         hidden_size = config.moe_hidden_size
+        self.moe_hidden_size = hidden_size
         # The checkpoint keeps these BF16, so only online quantization applies.
         online_config = fp8_dense.online_quant_config(quant_config)
         self.pooler: ReplicatedLinear | None = _pooling_projection(
@@ -405,6 +406,55 @@ class MuseSparkMoE(nn.Module):
             reduce_results=not self.defer_reduce,
         )
         self.decode_moe = MuseSparkDecodeMoE.create(self)
+        self._mega_vllm_config = vllm_config if self.defer_reduce else None
+        self._mega_moe = None
+
+    def _mega_moe_for(self, shard: TokenShard | None):
+        """The layer's MegaMoE when this batch takes it, else None. The choice
+        depends only on the batch size, so every EP rank makes the same one."""
+        if shard is None or self._mega_vllm_config is None or self.is_sequence_parallel:
+            return None
+        if self._mega_moe is not None:
+            return self._mega_moe if shard.num_tokens >= self._mega_min_tokens else None
+        weights = getattr(self.experts.routed_experts, "mega_moe_weights", None)
+        if weights is None:
+            return None
+        from vllm.models.muse_spark.amd.mega_moe import (
+            MuseSparkMegaMoE,
+            mega_moe_min_tokens,
+        )
+
+        norm = self.post_expert_norm
+        self._mega_min_tokens = mega_moe_min_tokens()
+        self._mega_moe = MuseSparkMegaMoE(
+            self._mega_vllm_config,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            hidden_size=self.moe_hidden_size,
+            intermediate_size=self.intermediate_size,
+            weights=weights,
+            norm_weight=norm.weight.data,
+            norm_gain_center=norm.gain_center,
+            norm_eps=norm.variance_epsilon,
+        )
+        return self._mega_moe if shard.num_tokens >= self._mega_min_tokens else None
+
+    def _forward_mega_moe(self, hidden_states: torch.Tensor, mega) -> torch.Tensor:
+        """This rank's rows through MegaMoE: no gather of pooled rows or
+        router logits, no reduce-scatter of the output."""
+        router_logits = self._router_logits(hidden_states)
+        if self.pooler is not None:
+            hidden_states, _ = self.pooler(hidden_states)
+        if self.pre_expert_norm is not None:
+            hidden_states = self.pre_expert_norm(hidden_states)
+        topk_weights, topk_ids = self.moe_router._compute_routing(
+            hidden_states, router_logits, torch.int32
+        )
+        experts_out = mega(hidden_states, topk_weights, topk_ids)
+        if self.unpooler is None:
+            return experts_out.clone()
+        experts_out, _ = self.unpooler(experts_out)
+        return experts_out
 
     def _load_router_weight(
         self, param: nn.Parameter, loaded_weight: torch.Tensor
@@ -550,6 +600,9 @@ class MuseSparkMoE(nn.Module):
             )
             if kernels is not None:
                 return self.decode_moe(self, hidden_states, kernels, shard, fp8_act)
+        mega = self._mega_moe_for(shard)
+        if mega is not None:
+            return self._forward_mega_moe(hidden_states, mega)
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
             fp8_act = None  # the rows were re-chunked; the pooler quantizes its own
