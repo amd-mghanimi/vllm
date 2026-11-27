@@ -904,6 +904,10 @@ class MuseSparkQuarkOCPMXFusedMoE(QuarkOCP_MX_MoEMethod):
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.models.muse_spark.amd import mega_moe
+
+        if mega_moe.mega_moe_enabled() and self.moe.moe_parallel_config.use_ep:
+            layer.mega_moe_weights = mega_moe.shuffle_mega_weights(layer)
         if column_sharded_down_supported(layer.moe_config):
             # From the checkpoint layout, before the AITER shuffle below; the
             # experts take it over when the kernel is built.
