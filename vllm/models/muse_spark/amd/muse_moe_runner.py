@@ -703,6 +703,13 @@ class MuseSparkQuarkOCPMXFusedMoE(QuarkOCP_MX_MoEMethod):
             post_expert_norm_fn=post_expert_norm_fn,
         )
 
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.models.muse_spark.amd import mega_moe
+
+        if mega_moe.mega_moe_enabled() and self.moe.moe_parallel_config.use_ep:
+            layer.mega_moe_weights = mega_moe.shuffle_mega_weights(layer)
+        super().process_weights_after_loading(layer)
+
 
 def _quantize_experts_to_mxfp4(
     weight: torch.Tensor, experts_per_chunk: int = 32
