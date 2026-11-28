@@ -419,6 +419,7 @@ class MuseSparkMoE(nn.Module):
         weights = getattr(self.experts.routed_experts, "mega_moe_weights", None)
         if weights is None:
             return None
+        pool = getattr(self.experts.routed_experts, "mega_moe_pool", None)
         from vllm.models.muse_spark.amd.mega_moe import (
             MuseSparkMegaMoE,
             mega_moe_min_tokens,
@@ -436,10 +437,13 @@ class MuseSparkMoE(nn.Module):
             norm_weight=norm.weight.data,
             norm_gain_center=norm.gain_center,
             norm_eps=norm.variance_epsilon,
+            pool=pool,
         )
         return self._mega_moe if shard.num_tokens >= self._mega_min_tokens else None
 
-    def _forward_mega_moe(self, hidden_states: torch.Tensor, mega) -> torch.Tensor:
+    def _forward_mega_moe(
+        self, hidden_states: torch.Tensor, mega, replica: bool
+    ) -> torch.Tensor:
         """This rank's rows through MegaMoE: no gather of pooled rows or
         router logits, no reduce-scatter of the output."""
         router_logits = self._router_logits(hidden_states)
@@ -450,7 +454,7 @@ class MuseSparkMoE(nn.Module):
         topk_weights, topk_ids = self.moe_router._compute_routing(
             hidden_states, router_logits, torch.int32
         )
-        experts_out = mega(hidden_states, topk_weights, topk_ids)
+        experts_out = mega(hidden_states, topk_weights, topk_ids, replica=replica)
         if self.unpooler is None:
             return experts_out.clone()
         experts_out, _ = self.unpooler(experts_out)
@@ -602,7 +606,9 @@ class MuseSparkMoE(nn.Module):
                 return self.decode_moe(self, hidden_states, kernels, shard, fp8_act)
         mega = self._mega_moe_for(shard)
         if mega is not None:
-            return self._forward_mega_moe(hidden_states, mega)
+            return self._forward_mega_moe(
+                hidden_states, mega, mega.use_replicas(shard.num_tokens)
+            )
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
             fp8_act = None  # the rows were re-chunked; the pooler quantizes its own
